@@ -1,0 +1,3679 @@
+diff --git a/packages/loot-core/src/mocks/sync-replay.ts b/packages/loot-core/src/mocks/sync-replay.ts
+new file mode 100644
+index 000000000..1b818e702
+--- /dev/null
++++ b/packages/loot-core/src/mocks/sync-replay.ts
+@@ -0,0 +1,72 @@
++import { Timestamp } from '@actual-app/crdt';
++
++import * as sqlite from '#platform/server/sqlite';
++import * as db from '#server/db';
++import { sendMessages } from '#server/sync';
++import type { Message } from '#server/sync';
++
++// Lets a test deliver everything it did to a budget the way another device
++// receives it: as one batch of changes applied to the budget as it was
++// before, instead of one change at a time.
++
++const SYNCED_TABLES = [
++  'category_groups',
++  'categories',
++  'category_mapping',
++  'zero_budgets',
++  'reflect_budgets',
++  'zero_budget_months',
++  'accounts',
++  'transactions',
++];
++
++type Row = Record<string, string | number | null>;
++type Rows = Map<string, Map<string, Row>>;
++
++export type DatabaseSnapshot = { image: Buffer; rows: Rows };
++
++function readRows(): Rows {
++  const rows: Rows = new Map();
++  for (const table of SYNCED_TABLES) {
++    const tableRows = db.runQuery<Row>(`SELECT * FROM ${table}`, [], true);
++    rows.set(table, new Map(tableRows.map(row => [String(row.id), row])));
++  }
++  return rows;
++}
++
++export function snapshotDatabase(): DatabaseSnapshot {
++  // The test database is an in-memory better-sqlite3 one
++  const database = db.getDatabase() as unknown as { serialize: () => Buffer };
++  return { image: database.serialize(), rows: readRows() };
++}
++
++// Goes back to the snapshot, lets the caller load the budget from it, and
++// then applies every change made since in a single batch
++export async function replayChangesAsOneSync(
++  snapshot: DatabaseSnapshot,
++  loadBudget: () => Promise<void>,
++): Promise<void> {
++  const changedRows = readRows();
++
++  db.setDatabase(await sqlite.openDatabase(snapshot.image));
++  await loadBudget();
++
++  const messages: Message[] = [];
++  for (const [table, rows] of changedRows) {
++    for (const [id, row] of rows) {
++      const before = snapshot.rows.get(table)?.get(id);
++      for (const [column, value] of Object.entries(row)) {
++        const hasChanged = before ? before[column] !== value : value != null;
++        if (column !== 'id' && hasChanged) {
++          const timestamp = Timestamp.send();
++          if (!timestamp) {
++            throw new Error('The clock has to be loaded to replay changes');
++          }
++          messages.push({ dataset: table, row: id, column, value, timestamp });
++        }
++      }
++    }
++  }
++
++  await sendMessages(messages);
++}
+diff --git a/packages/loot-core/src/server/api.test.ts b/packages/loot-core/src/server/api.test.ts
+index 1201dced9..db03b73b7 100644
+--- a/packages/loot-core/src/server/api.test.ts
++++ b/packages/loot-core/src/server/api.test.ts
+@@ -7,6 +7,7 @@ import type { ServerHandlers } from '#types/server-handlers';
+ import { app as accountGroupsApp } from './account-groups/app';
+ import { app as accountsApp } from './accounts/app';
+ import { installAPI } from './api';
++import { setCategoryCarryover } from './budget/actions';
+ import { createBudget } from './budget/base';
+ import * as prefs from './prefs';
+ import { app as transactionsApp } from './transactions/app';
+@@ -278,6 +279,35 @@ describe('API handlers', () => {
+       expect(group?.categories?.[0]).not.toHaveProperty('balance');
+     });
+ 
++    it('envelope budget: reports income held automatically as held for next month', async () => {
++      await createBudget(['2026-02', '2026-03']);
++      await db.insertTransaction({
++        id: 'tx1',
++        date: '2026-03-15',
++        account: 'acct1',
++        amount: 5000,
++        category: 'income-cat',
++      });
++      await setCategoryCarryover({
++        startMonth: '2026-03',
++        category: 'income-cat',
++        flag: true,
++      });
++      await sheet.waitOnSpreadsheet();
++
++      const result = await handlers['api/budget-month']({ month: '2026-03' });
++
++      // All of it is held, so there is nothing left to budget
++      expect(result.forNextMonth).toBe(5000);
++      expect(result.toBudget).toBe(0);
++      expect(
++        result.incomeAvailable +
++          result.lastMonthOverspent +
++          result.totalBudgeted -
++          result.forNextMonth,
++      ).toBe(result.toBudget);
++    });
++
+     it('tracking budget: income group returns budgeted, received, and balance', async () => {
+       sheet.get().meta().budgetType = 'tracking';
+       await db.update('preferences', { id: 'budgetType', value: 'tracking' });
+diff --git a/packages/loot-core/src/server/api.ts b/packages/loot-core/src/server/api.ts
+index 1532d59de..95e60e25b 100644
+--- a/packages/loot-core/src/server/api.ts
++++ b/packages/loot-core/src/server/api.ts
+@@ -502,7 +502,9 @@ handlers['api/budget-month'] = async function ({ month }) {
+     month,
+     incomeAvailable: value('available-funds') as number,
+     lastMonthOverspent: value('last-month-overspent') as number,
+-    forNextMonth: value('buffered') as number,
++    // What is actually held, which is the automatic hold when nothing was
++    // held by hand. To Budget has it taken out either way.
++    forNextMonth: value('buffered-selected') as number,
+     totalBudgeted: value('total-budgeted') as number,
+     toBudget: value('to-budget') as number,
+ 
+diff --git a/packages/loot-core/src/server/budget/actions.ts b/packages/loot-core/src/server/budget/actions.ts
+index 3cecc793b..d675b80c5 100644
+--- a/packages/loot-core/src/server/budget/actions.ts
++++ b/packages/loot-core/src/server/budget/actions.ts
+@@ -68,37 +68,6 @@ function monthFromDbMonth(month: number): string {
+   return `${monthString.slice(0, 4)}-${monthString.slice(4)}`;
+ }
+ 
+-// TODO: complete list of fields.
+-type BudgetData = {
+-  is_income: 1 | 0;
+-  hidden: 1 | 0;
+-  group_hidden: 1 | 0;
+-  category: string;
+-  amount: number;
+-};
+-
+-function getBudgetData<T extends BudgetTable>(
+-  table: T,
+-  month: string,
+-): Promise<BudgetData[]> {
+-  return db.all<
+-    (db.DbReflectBudget | db.DbZeroBudget) &
+-      Pick<
+-        db.DbViewCategoryWithGroupHidden,
+-        'is_income' | 'hidden' | 'group_hidden'
+-      >
+-  >(
+-    `
+-    SELECT b.*, c.is_income, c.hidden, g.hidden AS group_hidden
+-    FROM ${table} b
+-    LEFT JOIN categories c ON b.category = c.id
+-    LEFT JOIN category_groups g ON c.cat_group = g.id
+-    WHERE c.tombstone = 0 AND b.month = ?
+-  `,
+-    [month],
+-  );
+-}
+-
+ function getAllMonths(startMonth: string): string[] {
+   const { createdMonths } = sheet.get().meta();
+   let latest = null;
+@@ -127,6 +96,22 @@ export function getBudget({
+   return existing ? existing.amount || 0 : 0;
+ }
+ 
++// A month that has nothing saved for a category yet follows the month before
++// it for rolling over overspending (see `getInheritedCarryover`). The first
++// thing saved for it has to say so too, or the new row would turn it off.
++function getCarryoverForNewRow(
++  month: string,
++  category: string,
++): { carryover?: 1 } {
++  const isOn = sheet
++    .get()
++    ?.getCellValueLoose(
++      monthUtils.sheetForMonth(month),
++      `carryover-${category}`,
++    );
++  return isOn === true ? { carryover: 1 } : {};
++}
++
+ export function setBudget({
+   category,
+   month,
+@@ -153,6 +138,7 @@ export function setBudget({
+     month: dbMonth(month),
+     category,
+     amount,
++    ...getCarryoverForNewRow(month, category),
+   });
+ }
+ 
+@@ -177,6 +163,7 @@ export function setGoal({ month, category, goal, long_goal }): Promise<void> {
+     category,
+     goal,
+     long_goal,
++    ...getCarryoverForNewRow(month, category),
+   });
+ }
+ 
+@@ -224,24 +211,29 @@ export async function copyPreviousMonth({
+ }: {
+   month: string;
+ }): Promise<void> {
+-  const prevMonth = dbMonth(monthUtils.prevMonth(month));
+-  const table = getBudgetTable();
+-  const budgetData = await getBudgetData(table, prevMonth.toString());
++  const prevMonth = monthUtils.prevMonth(month);
++  const categories = await db.all<db.DbViewCategoryWithGroupHidden>(
++    `
++  SELECT c.*
++  FROM categories c
++  LEFT JOIN category_groups g ON c.cat_group = g.id
++  WHERE c.tombstone = 0 AND c.hidden = 0 AND g.hidden = 0
++  `,
++  );
+ 
+   await batchMessages(async () => {
+-    budgetData.forEach(prevBudget => {
+-      if (prevBudget.is_income === 1 && !isTrackingBudget()) {
+-        return;
++    for (const cat of categories) {
++      if (cat.is_income === 1 && !isTrackingBudget()) {
++        continue;
+       }
+-      if (prevBudget.hidden === 1 || prevBudget.group_hidden === 1) {
+-        return;
++
++      // A category with nothing budgeted last month has nothing budgeted
++      // after the copy either, rather than keeping what it had
++      const amount = getBudget({ category: cat.id, month: prevMonth });
++      if (amount !== getBudget({ category: cat.id, month })) {
++        void setBudget({ category: cat.id, month, amount });
+       }
+-      void setBudget({
+-        category: prevBudget.category,
+-        month,
+-        amount: prevBudget.amount,
+-      });
+-    });
++    }
+   });
+ }
+ 
+@@ -547,20 +539,16 @@ export async function holdForNextMonth({
+   month: string;
+   amount: number;
+ }): Promise<boolean> {
+-  const row = await db.first<Pick<db.DbZeroBudgetMonth, 'buffered'>>(
+-    'SELECT buffered FROM zero_budget_months WHERE id = ?',
+-    [month],
+-  );
+-
+   const sheetName = monthUtils.sheetForMonth(month);
+   const toBudget = await getSheetValue(sheetName, 'to-budget');
++  // What is held right now, which is the automatic hold when nothing has been
++  // held by hand. To Budget already has it taken out, so the amount goes on
++  // top of it: starting from the manual hold alone would replace an automatic
++  // hold with just this amount and hand the rest back to To Budget.
++  const held = await getSheetValue(sheetName, 'buffered-selected');
+ 
+   if (toBudget > 0) {
+-    const bufferedAmount = calcBufferedAmount(
+-      toBudget,
+-      (row && row.buffered) || 0,
+-      amount,
+-    );
++    const bufferedAmount = calcBufferedAmount(toBudget, held, amount);
+ 
+     await setBuffer(month, bufferedAmount);
+     return true;
+diff --git a/packages/loot-core/src/server/budget/app.ts b/packages/loot-core/src/server/budget/app.ts
+index 1891ec345..5a99c40de 100644
+--- a/packages/loot-core/src/server/budget/app.ts
++++ b/packages/loot-core/src/server/budget/app.ts
+@@ -428,12 +428,10 @@ async function deleteCategory({
+       throw new Error('Cannot transfer between income and expense categories.');
+     }
+ 
+-    // Update spreadsheet values if it's an expense category
+-    // TODO: We should do this for income too if it's a tracking budget
+-    if (row.is_income === 0) {
+-      if (transferId) {
+-        await budget.doTransfer([id], transferId);
+-      }
++    // Move the budgeted amounts over to the category taking its place.
++    // Income is only budgeted in a tracking budget.
++    if (transferId && (row.is_income === 0 || actions.isTrackingBudget())) {
++      await budget.doTransfer([id], transferId);
+     }
+ 
+     await db.deleteCategory({ id }, transferId);
+diff --git a/packages/loot-core/src/server/budget/base.ts b/packages/loot-core/src/server/budget/base.ts
+index cf44ea929..9f9af10a1 100644
+--- a/packages/loot-core/src/server/budget/base.ts
++++ b/packages/loot-core/src/server/budget/base.ts
+@@ -198,10 +198,13 @@ export function createCategory(cat, sheetName, prevSheetName, start, end) {
+ 
+ function handleAccountChange(months, oldValue, newValue) {
+   if (!oldValue || oldValue.offbudget !== newValue.offbudget) {
+-    const rows = db.runQuery<Pick<db.DbTransaction, 'category'>>(
++    // Spending counts towards the category a transaction's own category has
++    // been merged into, the same way the `sum-amount` cells look it up.
++    const rows = db.runQuery<Pick<db.DbCategoryMapping, 'transferId'>>(
+       `
+-        SELECT DISTINCT(category) as category FROM transactions
+-        WHERE acct = ?
++        SELECT DISTINCT cm.transferId FROM transactions t
++        INNER JOIN category_mapping cm ON cm.id = t.category
++        WHERE t.acct = ?
+       `,
+       [newValue.id],
+       true,
+@@ -213,7 +216,7 @@ function handleAccountChange(months, oldValue, newValue) {
+       rows.forEach(row => {
+         sheet
+           .get()
+-          .recompute(resolveName(sheetName, 'sum-amount-' + row.category));
++          .recompute(resolveName(sheetName, 'sum-amount-' + row.transferId));
+       });
+     });
+   }
+@@ -277,6 +280,19 @@ function handleBudgetChange(budget) {
+   }
+ }
+ 
++// A category that comes back after being deleted gets its cells back, but
++// the sheet only holds its amounts if it was alive when the sheet was built
++// (deleted categories are skipped on load). Read them again so the restored
++// category shows what was budgeted for it.
++function handleCategoryRestored(category, budgetTable) {
++  const budgets = db.runQuery<db.DbZeroBudget | db.DbReflectBudget>(
++    `SELECT * FROM ${budgetTable} WHERE category = ?`,
++    [category.id],
++    true,
++  );
++  budgets.forEach(handleBudgetChange);
++}
++
+ export function triggerBudgetChanges(oldValues, newValues) {
+   const { createdMonths = new Set() } = sheet.get().meta();
+   const budgetType = getBudgetType();
+@@ -311,6 +327,16 @@ export function triggerBudgetChanges(oldValues, newValues) {
+         } else if (table === 'category_mapping') {
+           handleCategoryMappingChange(createdMonths, oldValue, newValue);
+         } else if (table === 'categories') {
++          // Before its cells are created, so the months nothing is saved for
++          // follow the saved ones the way they do when the budget is loaded
++          if (
++            oldValue &&
++            oldValue.tombstone !== 0 &&
++            newValue.tombstone === 0
++          ) {
++            handleCategoryRestored(newValue, budgetTable);
++          }
++
+           if (budgetType === 'envelope') {
+             envelopeBudget.handleCategoryChange(
+               createdMonths,
+@@ -348,6 +374,9 @@ export function triggerBudgetChanges(oldValues, newValues) {
+   }
+ }
+ 
++// Moves what was budgeted for the given categories to the one taking their
++// place. Each month it ends up with exactly what was entered for all of them
++// together; no other amount is made up or changed.
+ export async function doTransfer(categoryIds, transferId) {
+   const { createdMonths: months } = sheet.get().meta();
+ 
+@@ -358,6 +387,11 @@ export async function doTransfer(categoryIds, transferId) {
+       })
+       .reduce((total, value) => total + value, 0);
+ 
++    // Nothing to move, so nothing is saved for the month either
++    if (totalValue === 0) {
++      return;
++    }
++
+     const transferValue = budgetActions.getBudget({
+       month,
+       category: transferId,
+diff --git a/packages/loot-core/src/server/budget/category-changes.test.ts b/packages/loot-core/src/server/budget/category-changes.test.ts
+new file mode 100644
+index 000000000..7c8302924
+--- /dev/null
++++ b/packages/loot-core/src/server/budget/category-changes.test.ts
+@@ -0,0 +1,218 @@
++import * as db from '#server/db';
++import { runHandler } from '#server/mutators';
++import * as sheet from '#server/sheet';
++import { batchMessages } from '#server/sync';
++
++import { getSheetValue, setBudget } from './actions';
++import { app } from './app';
++import * as budget from './base';
++
++// Totals after categories are reorganised. The spreadsheet is patched as
++// changes come in rather than rebuilt, so these check the patched totals
++// against the amounts that were budgeted and spent.
++
++type BudgetType = 'envelope' | 'tracking';
++
++const MONTH = '2024-01';
++const SHEET = 'budget202401';
++
++async function loadBudget(budgetType: BudgetType) {
++  await sheet.loadSpreadsheet(db);
++  sheet.get().meta().budgetType = budgetType;
++  await budget.createBudget([MONTH]);
++}
++
++// Home:     food  5,000 budgeted, 3,000 spent (personal account)
++//           rent 20,000 budgeted
++// Business: stock 6,000 budgeted, 7,000 spent (business account)
++//           tools 2,000 budgeted, 1,000 spent (business account)
++async function setUpBudget(budgetType: BudgetType) {
++  db.runQuery("INSERT INTO preferences (id, value) VALUES ('budgetType', ?)", [
++    budgetType,
++  ]);
++
++  await db.insertAccount({ id: 'personal', name: 'Personal' });
++  await db.insertAccount({ id: 'business', name: 'Business' });
++
++  await db.insertCategoryGroup({ id: 'income', name: 'Income', is_income: 1 });
++  for (const id of ['salary', 'sales']) {
++    await db.insertCategory({
++      id,
++      name: id,
++      cat_group: 'income',
++      is_income: 1,
++    });
++  }
++
++  await db.insertCategoryGroup({ id: 'home', name: 'Home' });
++  await db.insertCategoryGroup({ id: 'work', name: 'Work' });
++  for (const [id, group] of [
++    ['food', 'home'],
++    ['rent', 'home'],
++    ['stock', 'work'],
++    ['tools', 'work'],
++  ]) {
++    await db.insertCategory({ id, name: id, cat_group: group });
++  }
++
++  for (const [category, amount, account] of [
++    ['salary', 100000, 'personal'],
++    ['food', -3000, 'personal'],
++    ['stock', -7000, 'business'],
++    ['tools', -1000, 'business'],
++  ] as const) {
++    await db.insertTransaction({
++      date: `${MONTH}-15`,
++      amount,
++      account,
++      category,
++    });
++  }
++
++  await loadBudget(budgetType);
++
++  for (const [category, amount] of [
++    ['food', 5000],
++    ['rent', 20000],
++    ['stock', 6000],
++    ['tools', 2000],
++  ] as const) {
++    await setBudget({ category, month: MONTH, amount });
++  }
++  await sheet.waitOnSpreadsheet();
++}
++
++async function value(cell: string) {
++  await sheet.waitOnSpreadsheet();
++  return getSheetValue(SHEET, cell);
++}
++
++beforeEach(global.emptyDatabase());
++
++describe.each(['envelope', 'tracking'] as const)(
++  'Reorganising categories (%s)',
++  budgetType => {
++    beforeEach(() => setUpBudget(budgetType));
++
++    it('stops counting a category that is moved and deleted in the same batch of changes', async () => {
++      // A sync delivers everything another device did in one batch, so the
++      // move to another group and the deletion arrive together
++      await batchMessages(async () => {
++        await db.moveCategory('stock', 'home', null);
++        await runHandler(app.handlers['category-delete'], {
++          id: 'stock',
++          transferId: 'tools',
++        });
++      });
++
++      // Tools takes over what was budgeted and spent on stock, and nothing
++      // is left of it in the group it was in before the move
++      expect(await value('budget-tools')).toBe(8000);
++      expect(await value('group-budget-work')).toBe(8000);
++      expect(await value('group-sum-amount-work')).toBe(-8000);
++      expect(await value('group-budget-home')).toBe(25000);
++      expect(Math.abs(await value('total-budgeted'))).toBe(33000);
++
++      if (budgetType === 'envelope') {
++        expect(await value('to-budget')).toBe(67000);
++      }
++    });
++
++    it('recalculates spending merged from another category when its account goes off budget', async () => {
++      await runHandler(app.handlers['category-delete'], {
++        id: 'food',
++        transferId: 'tools',
++      });
++      expect(await value('sum-amount-tools')).toBe(-4000);
++
++      // The food spending now counted under tools was all in this account
++      await db.updateAccount({ id: 'personal', offbudget: 1 });
++      expect(await value('sum-amount-tools')).toBe(-1000);
++
++      await db.updateAccount({ id: 'personal', offbudget: 0 });
++      expect(await value('sum-amount-tools')).toBe(-4000);
++    });
++
++    it('leaves a category that was merged earlier where it is when its old group is deleted', async () => {
++      await runHandler(app.handlers['category-delete'], {
++        id: 'food',
++        transferId: 'tools',
++      });
++      await runHandler(app.handlers['category-group-delete'], {
++        id: 'home',
++        transferId: 'stock',
++      });
++
++      // Food went to tools with its budget, so its spending stays there
++      // rather than following the rest of the group to stock
++      expect(await value('budget-tools')).toBe(7000);
++      expect(await value('sum-amount-tools')).toBe(-4000);
++      expect(await value('budget-stock')).toBe(26000);
++      expect(await value('sum-amount-stock')).toBe(-7000);
++    });
++
++    it('shows the budgeted amounts of a category restored after the budget was loaded without it', async () => {
++      await db.deleteCategory({ id: 'stock' });
++      await sheet.waitOnSpreadsheet();
++
++      // Deleted categories are skipped when the budget is built from scratch
++      sheet.unloadSpreadsheet();
++      await loadBudget(budgetType);
++      expect(await value('group-budget-work')).toBe(2000);
++
++      // Undoing the deletion, as another device would sync it
++      await db.update('categories', { id: 'stock', tombstone: 0 });
++
++      expect(await value('budget-stock')).toBe(6000);
++      expect(await value('group-budget-work')).toBe(8000);
++    });
++  },
++);
++
++describe('Reorganising categories in a tracking budget', () => {
++  beforeEach(() => setUpBudget('tracking'));
++
++  it('leaves a hidden category out of the totals of the group it is moved to', async () => {
++    await db.update('categories', { id: 'food', hidden: 1 });
++    expect(await value('group-budget-home')).toBe(20000);
++
++    await db.moveCategory('food', 'work', null);
++
++    expect(await value('group-budget-work')).toBe(8000);
++    expect(await value('group-sum-amount-work')).toBe(-8000);
++    expect(await value('total-budgeted')).toBe(28000);
++  });
++
++  it('leaves out a category that is moved and hidden in the same batch of changes', async () => {
++    await batchMessages(async () => {
++      await db.moveCategory('food', 'work', null);
++      await db.update('categories', { id: 'food', hidden: 1 });
++    });
++
++    expect(await value('group-budget-home')).toBe(20000);
++    expect(await value('group-budget-work')).toBe(8000);
++    expect(await value('total-budgeted')).toBe(28000);
++  });
++
++  it('keeps income out of the expense totals when the income group is shown again', async () => {
++    await db.update('category_groups', { id: 'income', hidden: 1 });
++    await db.update('category_groups', { id: 'income', hidden: 0 });
++
++    expect(await value('total-spent')).toBe(-11000);
++    expect(await value('total-budgeted')).toBe(33000);
++  });
++
++  it('moves budgeted income to the category an income category is merged into', async () => {
++    await setBudget({ category: 'salary', month: MONTH, amount: 100000 });
++    await setBudget({ category: 'sales', month: MONTH, amount: 30000 });
++    expect(await value('total-budget-income')).toBe(130000);
++
++    await runHandler(app.handlers['category-delete'], {
++      id: 'sales',
++      transferId: 'salary',
++    });
++
++    expect(await value('budget-salary')).toBe(130000);
++    expect(await value('total-budget-income')).toBe(130000);
++  });
++});
+diff --git a/packages/loot-core/src/server/budget/envelope-balance.test.ts b/packages/loot-core/src/server/budget/envelope-balance.test.ts
+new file mode 100644
+index 000000000..4dcc21669
+--- /dev/null
++++ b/packages/loot-core/src/server/budget/envelope-balance.test.ts
+@@ -0,0 +1,442 @@
++import * as db from '#server/db';
++import { runHandler } from '#server/mutators';
++import * as sheet from '#server/sheet';
++
++import {
++  getSheetBoolean,
++  getSheetValue,
++  holdForNextMonth,
++  resetHold,
++  setBudget,
++  setCategoryCarryover,
++} from './actions';
++import { app } from './app';
++import * as budget from './base';
++
++// The figures of an envelope budget worked out by hand, month by month, and
++// what holding funds, merging categories and rolling over overspending are
++// meant to do to them. The expected amounts are written out rather than
++// taken from the budget recalculating itself, which would agree with itself
++// whether or not it is right.
++//
++//             January                 February               March
++//   Income    1,000.00 salary         1,000.00 salary        -
++//   Food      300 budgeted, 350 spent 300 budgeted, 200 spent
++//             = -50.00 (overspent)    = 100.00               100.00
++//   Fun       100 budgeted, 40 spent  100 budgeted
++//             = 60.00                 = 160.00               160.00
++//   To Budget 1,000 - 400             600 + 1,000 - 50 - 400
++//             = 600.00                = 1,150.00             1,150.00
++//
++// The 50.00 overspent on food in January comes out of February's To Budget
++// and food starts February from zero.
++
++const MONTHS = ['2024-01', '2024-02', '2024-03'];
++
++async function loadBudget(months = MONTHS) {
++  await sheet.loadSpreadsheet(db);
++  await budget.createBudget(months);
++}
++
++async function value(month: string, cell: string) {
++  await sheet.waitOnSpreadsheet();
++  return getSheetValue(`budget${month.replace('-', '')}`, cell);
++}
++
++async function toBudget() {
++  const amounts: number[] = [];
++  for (const month of [...sheet.get().meta().createdMonths].sort()) {
++    amounts.push(await value(month, 'to-budget'));
++  }
++  return amounts;
++}
++
++async function balances(category: string) {
++  const amounts: number[] = [];
++  for (const month of [...sheet.get().meta().createdMonths].sort()) {
++    amounts.push(await value(month, `leftover-${category}`));
++  }
++  return amounts;
++}
++
++beforeEach(async () => {
++  await global.emptyDatabase()();
++
++  await db.insertAccount({ id: 'checking', name: 'Checking' });
++  await db.insertCategoryGroup({ id: 'income', name: 'Income', is_income: 1 });
++  for (const id of ['salary', 'sales']) {
++    await db.insertCategory({
++      id,
++      name: id,
++      cat_group: 'income',
++      is_income: 1,
++    });
++  }
++  await db.insertCategoryGroup({ id: 'home', name: 'Home' });
++  await db.insertCategory({ id: 'food', name: 'food', cat_group: 'home' });
++  await db.insertCategory({ id: 'fun', name: 'fun', cat_group: 'home' });
++
++  for (const [date, amount, category] of [
++    ['2024-01-05', 100000, 'salary'],
++    ['2024-01-10', -35000, 'food'],
++    ['2024-01-12', -4000, 'fun'],
++    ['2024-02-05', 100000, 'salary'],
++    ['2024-02-10', -20000, 'food'],
++  ] as const) {
++    await db.insertTransaction({ date, amount, category, account: 'checking' });
++  }
++
++  await loadBudget();
++
++  for (const month of ['2024-01', '2024-02']) {
++    await setBudget({ category: 'food', month, amount: 30000 });
++    await setBudget({ category: 'fun', month, amount: 10000 });
++  }
++});
++
++describe('Envelope budget balance', () => {
++  it('starts from the figures worked out by hand', async () => {
++    expect(await toBudget()).toEqual([60000, 115000, 115000]);
++    expect(await balances('food')).toEqual([-5000, 10000, 10000]);
++    expect(await balances('fun')).toEqual([6000, 16000, 16000]);
++  });
++
++  describe('holding funds for next month', () => {
++    it('takes the amount out of To Budget and gives it back the month after', async () => {
++      await holdForNextMonth({ month: '2024-01', amount: 50000 });
++
++      expect(await value('2024-01', 'buffered-selected')).toBe(50000);
++      // February still has everything January did not budget
++      expect(await toBudget()).toEqual([10000, 115000, 115000]);
++    });
++
++    it('holds no more than is left to budget', async () => {
++      await holdForNextMonth({ month: '2024-01', amount: 50000 });
++      await holdForNextMonth({ month: '2024-01', amount: 30000 });
++
++      expect(await value('2024-01', 'buffered-selected')).toBe(60000);
++      expect(await toBudget()).toEqual([0, 115000, 115000]);
++
++      await resetHold({ month: '2024-01' });
++      expect(await toBudget()).toEqual([60000, 115000, 115000]);
++    });
++
++    it('adds to what is already held automatically', async () => {
++      // 700.00 more income, with the salary held automatically:
++      // 1,700 - 400 budgeted - 1,000 held = 300.00 to budget
++      await db.insertTransaction({
++        date: '2024-01-06',
++        amount: 70000,
++        category: 'sales',
++        account: 'checking',
++      });
++      await setCategoryCarryover({
++        startMonth: '2024-01',
++        category: 'salary',
++        flag: true,
++      });
++      expect(await value('2024-01', 'buffered-selected')).toBe(100000);
++      expect(await value('2024-01', 'to-budget')).toBe(30000);
++
++      await holdForNextMonth({ month: '2024-01', amount: 20000 });
++
++      // Not 200.00 held and the salary handed back to To Budget
++      expect(await value('2024-01', 'buffered-selected')).toBe(120000);
++      expect(await value('2024-01', 'to-budget')).toBe(10000);
++    });
++  });
++
++  // The remaining category gets what was budgeted for both, exactly as it was
++  // entered, and every transaction of both. It is then worked out like any
++  // other category:
++  //
++  //             January                 February               March
++  //   Fun       400 budgeted, 390 spent 400 budgeted, 200 spent
++  //             = 10.00                 = 210.00               210.00
++  //   To Budget 600.00                  600 + 1,000 - 400
++  //                                     = 1,200.00             1,200.00
++  //
++  // Together the two were not overspent in January, so the 50.00 food was
++  // overspent by is covered by fun instead of February's To Budget. No money
++  // appears or disappears: To Budget and the balance still come to 1,410.00
++  // in February, as 1,150.00 + 260.00 did before.
++  describe('merging a category into another', () => {
++    async function mergeFoodIntoFun() {
++      await runHandler(app.handlers['category-delete'], {
++        id: 'food',
++        transferId: 'fun',
++      });
++    }
++
++    async function budgeted(category: string) {
++      const amounts: number[] = [];
++      for (const month of MONTHS) {
++        amounts.push(await value(month, `budget-${category}`));
++      }
++      return amounts;
++    }
++
++    it('budgets exactly what was entered for both and nothing else', async () => {
++      await mergeFoodIntoFun();
++
++      expect(await budgeted('fun')).toEqual([40000, 40000, 0]);
++      expect(await value('2024-01', 'total-budgeted')).toBe(-40000);
++      expect(await value('2024-02', 'total-budgeted')).toBe(-40000);
++    });
++
++    it('saves nothing for months where there was nothing to move', async () => {
++      await mergeFoodIntoFun();
++      await sheet.waitOnSpreadsheet();
++
++      const rows = await db.all<{ month: number }>(
++        "SELECT month FROM zero_budgets WHERE category = 'fun' ORDER BY month",
++      );
++      expect(rows.map(row => row.month)).toEqual([202401, 202402]);
++    });
++
++    it('works the remaining category out from everything budgeted and spent', async () => {
++      await mergeFoodIntoFun();
++
++      expect(await balances('fun')).toEqual([1000, 21000, 21000]);
++      expect(await toBudget()).toEqual([60000, 120000, 120000]);
++      expect(await value('2024-01', 'total-spent')).toBe(-39000);
++      expect(await value('2024-02', 'total-spent')).toBe(-20000);
++    });
++
++    it('keeps To Budget and the balances adding up to the same in every month', async () => {
++      const before = [61000, 141000, 141000];
++      const total = async () => {
++        const fun = await balances('fun');
++        const food = await balances('food');
++        return (await toBudget()).map(
++          (amount, index) => amount + fun[index] + food[index],
++        );
++      };
++      expect(await total()).toEqual(before);
++
++      await mergeFoodIntoFun();
++
++      const fun = await balances('fun');
++      expect(
++        (await toBudget()).map((amount, index) => amount + fun[index]),
++      ).toEqual(before);
++    });
++
++    it('leaves held funds alone', async () => {
++      await holdForNextMonth({ month: '2024-01', amount: 60000 });
++      await holdForNextMonth({ month: '2024-02', amount: 100000 });
++      expect(await toBudget()).toEqual([0, 15000, 115000]);
++
++      await mergeFoodIntoFun();
++
++      expect(await value('2024-01', 'buffered-selected')).toBe(60000);
++      expect(await value('2024-02', 'buffered-selected')).toBe(100000);
++      // 50.00 more in February, which food's overspending no longer takes
++      expect(await toBudget()).toEqual([0, 20000, 120000]);
++    });
++
++    it('follows the remaining category when it rolls over its overspending', async () => {
++      // 400.00 more spent on fun in January leaves it at -340.00, carried
++      // into February instead of coming out of To Budget
++      await db.insertTransaction({
++        date: '2024-01-20',
++        amount: -40000,
++        category: 'fun',
++        account: 'checking',
++      });
++      await setCategoryCarryover({
++        startMonth: '2024-01',
++        category: 'fun',
++        flag: true,
++      });
++      expect(await toBudget()).toEqual([60000, 115000, 115000]);
++      expect(await balances('fun')).toEqual([-34000, -24000, -24000]);
++      expect(await balances('food')).toEqual([-5000, 10000, 10000]);
++
++      await mergeFoodIntoFun();
++
++      // -390.00 carried, then 400.00 budgeted and 200.00 spent
++      expect(await budgeted('fun')).toEqual([40000, 40000, 0]);
++      expect(await balances('fun')).toEqual([-39000, -19000, -19000]);
++      expect(await toBudget()).toEqual([60000, 120000, 120000]);
++    });
++
++    it('merges every category of a deleted group the same way', async () => {
++      await db.insertCategoryGroup({ id: 'work', name: 'Work' });
++      await db.insertCategory({
++        id: 'tools',
++        name: 'tools',
++        cat_group: 'work',
++      });
++      await setBudget({ category: 'tools', month: '2024-01', amount: 2000 });
++      expect(await toBudget()).toEqual([58000, 113000, 113000]);
++
++      await runHandler(app.handlers['category-group-delete'], {
++        id: 'home',
++        transferId: 'tools',
++      });
++
++      expect(await budgeted('tools')).toEqual([42000, 40000, 0]);
++      // 420 budgeted, 390 spent, then 400 budgeted, 200 spent
++      expect(await balances('tools')).toEqual([3000, 23000, 23000]);
++      expect(await toBudget()).toEqual([58000, 118000, 118000]);
++    });
++  });
++
++  // The screens only file a category under a group of its own kind, but the
++  // API or an import can leave an expense category in the income group. It
++  // is still an expense: none of the figures above may change.
++  describe('a category filed under a group of the other kind', () => {
++    async function expectStartingFigures() {
++      expect(await toBudget()).toEqual([60000, 115000, 115000]);
++      expect(await balances('food')).toEqual([-5000, 10000, 10000]);
++      expect(await value('2024-01', 'total-income')).toBe(100000);
++      expect(await value('2024-01', 'total-budgeted')).toBe(-40000);
++      expect(await value('2024-01', 'total-spent')).toBe(-39000);
++      expect(await value('2024-01', 'total-leftover')).toBe(1000);
++      expect(await value('2024-02', 'last-month-overspent')).toBe(-5000);
++    }
++
++    it('keeps spending out of the income when an expense category is moved into the income group', async () => {
++      await db.moveCategory('food', 'income', null);
++
++      await expectStartingFigures();
++      // Its group only adds up what is left in it
++      expect(await value('2024-01', 'group-budget-home')).toBe(10000);
++      expect(await value('2024-01', 'group-sum-amount-home')).toBe(-4000);
++    });
++
++    it('shows the same after the budget is loaded again', async () => {
++      await db.moveCategory('food', 'income', null);
++      await sheet.waitOnSpreadsheet();
++
++      sheet.unloadSpreadsheet();
++      await loadBudget();
++
++      await expectStartingFigures();
++      expect(await value('2024-01', 'group-budget-home')).toBe(10000);
++    });
++
++    it('counts it in its group again once it is moved back', async () => {
++      await db.moveCategory('food', 'income', null);
++      await db.moveCategory('food', 'home', null);
++
++      await expectStartingFigures();
++      expect(await value('2024-01', 'group-budget-home')).toBe(40000);
++      expect(await value('2024-01', 'group-sum-amount-home')).toBe(-39000);
++    });
++
++    it('budgets and spends from an expense category created in the income group', async () => {
++      await db.insertCategory({
++        id: 'tools',
++        name: 'tools',
++        cat_group: 'income',
++        is_income: 0,
++      });
++      await db.insertTransaction({
++        date: '2024-01-15',
++        amount: -3000,
++        category: 'tools',
++        account: 'checking',
++      });
++      await setBudget({ category: 'tools', month: '2024-01', amount: 2000 });
++
++      expect(await value('2024-01', 'total-income')).toBe(100000);
++      expect(await balances('tools')).toEqual([-1000, 0, 0]);
++      // 20.00 more budgeted in January, and 10.00 overspent taken out of
++      // February once
++      expect(await toBudget()).toEqual([58000, 112000, 112000]);
++    });
++
++    it('counts income filed under an expense group as income', async () => {
++      await db.insertCategory({
++        id: 'refunds',
++        name: 'refunds',
++        cat_group: 'home',
++        is_income: 1,
++      });
++      await db.insertTransaction({
++        date: '2024-01-15',
++        amount: 7000,
++        category: 'refunds',
++        account: 'checking',
++      });
++
++      expect(await value('2024-01', 'total-income')).toBe(107000);
++      expect(await value('2024-01', 'total-spent')).toBe(-39000);
++      expect(await value('2024-01', 'group-sum-amount-home')).toBe(-39000);
++      expect(await toBudget()).toEqual([67000, 122000, 122000]);
++    });
++  });
++
++  describe('rolling over overspending', () => {
++    const LATER_MONTHS = [...MONTHS, '2024-04', '2024-05'];
++
++    // With food rolling over, January's -50.00 stays in the category:
++    // February 600 + 1,000 - 400 = 1,200.00 to budget, food at 50.00.
++    // 300.00 spent in March leaves food at -250.00 from then on.
++    beforeEach(async () => {
++      await db.insertTransaction({
++        date: '2024-03-10',
++        amount: -30000,
++        category: 'food',
++        account: 'checking',
++      });
++      await setCategoryCarryover({
++        startMonth: '2024-01',
++        category: 'food',
++        flag: true,
++      });
++      await sheet.waitOnSpreadsheet();
++    });
++
++    it('keeps rolling over in months added to the budget later', async () => {
++      await budget.createBudget(LATER_MONTHS);
++
++      expect(await balances('food')).toEqual([
++        -5000, 5000, -25000, -25000, -25000,
++      ]);
++      expect(await toBudget()).toEqual([60000, 120000, 120000, 120000, 120000]);
++    });
++
++    it('keeps rolling over once something is budgeted in such a month', async () => {
++      await budget.createBudget(LATER_MONTHS);
++      await setBudget({ category: 'food', month: '2024-04', amount: 1000 });
++
++      expect(await getSheetBoolean('budget202404', 'carryover-food')).toBe(
++        true,
++      );
++      expect(await balances('food')).toEqual([
++        -5000, 5000, -25000, -24000, -24000,
++      ]);
++      expect(await toBudget()).toEqual([60000, 120000, 120000, 119000, 119000]);
++    });
++
++    it('shows the same after the budget is loaded again', async () => {
++      await budget.createBudget(LATER_MONTHS);
++      await setBudget({ category: 'food', month: '2024-04', amount: 1000 });
++      await sheet.waitOnSpreadsheet();
++
++      sheet.unloadSpreadsheet();
++      await loadBudget(LATER_MONTHS);
++
++      expect(await balances('food')).toEqual([
++        -5000, 5000, -25000, -24000, -24000,
++      ]);
++      expect(await toBudget()).toEqual([60000, 120000, 120000, 119000, 119000]);
++    });
++
++    it('stays off in later months once it is turned off', async () => {
++      await setCategoryCarryover({
++        startMonth: '2024-03',
++        category: 'food',
++        flag: false,
++      });
++      await budget.createBudget(LATER_MONTHS);
++
++      // March's -250.00 comes out of April's To Budget instead
++      expect(await balances('food')).toEqual([-5000, 5000, -25000, 0, 0]);
++      expect(await toBudget()).toEqual([60000, 120000, 120000, 95000, 95000]);
++    });
++  });
++});
+diff --git a/packages/loot-core/src/server/budget/envelope-ledger.test.ts b/packages/loot-core/src/server/budget/envelope-ledger.test.ts
+new file mode 100644
+index 000000000..750c40d28
+--- /dev/null
++++ b/packages/loot-core/src/server/budget/envelope-ledger.test.ts
+@@ -0,0 +1,714 @@
++import { replayChangesAsOneSync, snapshotDatabase } from '#mocks/sync-replay';
++import * as db from '#server/db';
++import { runHandler } from '#server/mutators';
++import * as sheet from '#server/sheet';
++import * as monthUtils from '#shared/months';
++
++import { app } from './app';
++import { createAllBudgets } from './base';
++
++// Runs random sequences of budget actions and checks the budget against an
++// independent ledger after every one of them.
++//
++// The ledger is told what each action is meant to do (move 20.00 from A to
++// B, hold 50.00, merge A into B ...) and works every month out from the
++// envelope rules alone. Comparing the budget with its own from-scratch
++// recalculation can't replace this: both follow the same code, so they agree
++// just as well when money is allocated to the wrong place. On top of the
++// ledger, every month has to account for the money actually in the on-budget
++// accounts: To Budget + held + category balances = cash.
++//
++// A category is income or an expense by its own setting, wherever it is
++// filed: the API or an import can leave an expense category in the income
++// group, and what is spent in it is still spending, not negative income.
++
++const handlers = app.handlers;
++
++const FIRST_MONTHS = ['2016-10', '2016-11', '2016-12', '2017-01'];
++const ACTION_MONTHS = [...FIRST_MONTHS, '2017-02', '2017-03'];
++const SEEDS = Number(process.env.LEDGER_SEEDS || 40);
++const STEPS = 12;
++
++type Transaction = {
++  id: string;
++  month: string;
++  amount: number;
++  category: string;
++  account: string;
++};
++
++type MonthFigures = {
++  toBudget: number;
++  held: number;
++  budgeted: number;
++  spent: number;
++  income: number;
++  balances: Map<string, number>;
++};
++
++type Ledger = {
++  months: string[];
++  expense: Set<string>;
++  income: Set<string>;
++  onBudget: Map<string, boolean>;
++  transactions: Transaction[];
++  // `${month}|${category}` to an amount or a flag
++  budgeted: Map<string, number>;
++  autoHold: Map<string, boolean>;
++  // Rolling over overspending is turned on or off from a month on
++  rollover: Map<string, Array<[string, boolean]>>;
++  held: Map<string, number>;
++};
++
++function createLedger(): Ledger {
++  return {
++    months: [],
++    expense: new Set(),
++    income: new Set(),
++    onBudget: new Map(),
++    transactions: [],
++    budgeted: new Map(),
++    autoHold: new Map(),
++    rollover: new Map(),
++    held: new Map(),
++  };
++}
++
++function getBudgeted(ledger: Ledger, month: string, category: string) {
++  return ledger.budgeted.get(`${month}|${category}`) ?? 0;
++}
++
++function addBudgeted(
++  ledger: Ledger,
++  month: string,
++  category: string,
++  amount: number,
++) {
++  ledger.budgeted.set(
++    `${month}|${category}`,
++    getBudgeted(ledger, month, category) + amount,
++  );
++}
++
++function getActivity(ledger: Ledger, month: string, category: string) {
++  return ledger.transactions
++    .filter(
++      t =>
++        t.month === month &&
++        t.category === category &&
++        ledger.onBudget.get(t.account),
++    )
++    .reduce((total, t) => total + t.amount, 0);
++}
++
++function rollsOver(ledger: Ledger, month: string, category: string) {
++  let isOn = false;
++  for (const [start, flag] of ledger.rollover.get(category) ?? []) {
++    if (month >= start) {
++      isOn = flag;
++    }
++  }
++  return isOn;
++}
++
++// The envelope rules: what is not budgeted or held rolls into next month's
++// To Budget together with what was held; a category keeps its balance, except
++// that overspending comes out of next month's To Budget and the category
++// starts again from zero unless it rolls its overspending over.
++function computeMonths(ledger: Ledger): Map<string, MonthFigures> {
++  const figures = new Map<string, MonthFigures>();
++  const carried = new Map<string, number>();
++  let fromLastMonth = 0;
++  let overspentLastMonth = 0;
++
++  for (const month of ledger.months) {
++    const balances = new Map<string, number>();
++    let budgeted = 0;
++    let spent = 0;
++    let overspent = 0;
++
++    for (const category of ledger.expense) {
++      const activity = getActivity(ledger, month, category);
++      const balance =
++        (carried.get(category) ?? 0) +
++        getBudgeted(ledger, month, category) +
++        activity;
++      budgeted += getBudgeted(ledger, month, category);
++      spent += activity;
++      balances.set(category, balance);
++
++      if (balance < 0 && !rollsOver(ledger, month, category)) {
++        overspent += balance;
++        carried.set(category, 0);
++      } else {
++        carried.set(category, balance);
++      }
++    }
++
++    let income = 0;
++    let heldAutomatically = 0;
++    for (const category of ledger.income) {
++      const activity = getActivity(ledger, month, category);
++      income += activity;
++      if (ledger.autoHold.get(`${month}|${category}`)) {
++        heldAutomatically += activity;
++      }
++    }
++
++    const heldByHand = ledger.held.get(month) ?? 0;
++    const held = heldByHand !== 0 ? heldByHand : heldAutomatically;
++    const toBudget =
++      fromLastMonth + income + overspentLastMonth - budgeted - held;
++
++    figures.set(month, { toBudget, held, budgeted, spent, income, balances });
++    fromLastMonth = toBudget + held;
++    overspentLastMonth = overspent;
++  }
++
++  return figures;
++}
++
++function createRandom(seed: number) {
++  let state = seed >>> 0;
++  const next = () => {
++    state = (state * 1664525 + 1013904223) >>> 0;
++    return state / 4294967296;
++  };
++  return {
++    next,
++    upTo: (max: number) => Math.floor(next() * max),
++    pick: <T>(items: T[]): T => items[Math.floor(next() * items.length)],
++  };
++}
++
++async function setUpBudget(ledger: Ledger) {
++  await sheet.loadSpreadsheet(db);
++
++  await db.insertCategoryGroup({ id: 'income', name: 'Income', is_income: 1 });
++  for (const id of ['salary', 'sales']) {
++    await db.insertCategory({
++      id,
++      name: id,
++      cat_group: 'income',
++      is_income: 1,
++    });
++    ledger.income.add(id);
++  }
++
++  for (const [group, categories] of [
++    ['home', ['food', 'rent', 'fun']],
++    ['work', ['stock', 'tools']],
++    ['other', ['fees', 'gifts']],
++  ] as const) {
++    await db.insertCategoryGroup({ id: group, name: group });
++    for (const id of categories) {
++      await db.insertCategory({ id, name: id, cat_group: group });
++      ledger.expense.add(id);
++    }
++  }
++
++  for (const [id, offbudget] of [
++    ['checking', 0],
++    ['business', 0],
++    ['investments', 1],
++  ] as const) {
++    await db.insertAccount({ id, name: id, offbudget });
++    ledger.onBudget.set(id, offbudget === 0);
++  }
++
++  for (const month of FIRST_MONTHS) {
++    for (const [amount, category, account] of [
++      [500000, 'salary', 'checking'],
++      [200000, 'sales', 'business'],
++      [-40000, 'food', 'checking'],
++      [-100000, 'rent', 'checking'],
++      [-7000, 'fun', 'checking'],
++      [-60000, 'stock', 'business'],
++      [-9000, 'tools', 'business'],
++      [-1500, 'fees', 'checking'],
++      [-2500, 'gifts', 'investments'],
++    ] as const) {
++      await addTransaction(ledger, month, amount, category, account);
++    }
++  }
++
++  await createAllBudgets();
++  ledger.months = getCreatedMonths();
++
++  for (const month of FIRST_MONTHS) {
++    for (const [category, amount] of [
++      ['food', 35000],
++      ['rent', 100000],
++      ['fun', 10000],
++      ['stock', 50000],
++      ['tools', 12000],
++      ['fees', 1000],
++      ['gifts', 3000],
++    ] as const) {
++      await runHandler(handlers['budget/budget-amount'], {
++        month,
++        category,
++        amount,
++      });
++      addBudgeted(ledger, month, category, amount);
++    }
++  }
++}
++
++function getCreatedMonths() {
++  return [...sheet.get().meta().createdMonths].sort();
++}
++
++async function addTransaction(
++  ledger: Ledger,
++  month: string,
++  amount: number,
++  category: string,
++  account: string,
++) {
++  const id = `transaction-${ledger.transactions.length}`;
++  await db.insertTransaction({
++    id,
++    date: `${month}-15`,
++    amount,
++    category,
++    account,
++  });
++  ledger.transactions.push({ id, month, amount, category, account });
++}
++
++function readCell(month: string, name: string) {
++  const cell = sheet.getCellValue(monthUtils.sheetForMonth(month), name);
++  return typeof cell === 'number' ? cell : 0;
++}
++
++// Every way the budget disagrees with the ledger, or with the money in the
++// on-budget accounts
++async function findDiscrepancies(ledger: Ledger): Promise<string[]> {
++  await sheet.waitOnSpreadsheet();
++  const expected = computeMonths(ledger);
++  const discrepancies: string[] = [];
++
++  for (const month of ledger.months) {
++    const figures = expected.get(month);
++    if (!figures) {
++      continue;
++    }
++
++    const check = (label: string, actual: number, shouldBe: number) => {
++      if (actual !== shouldBe) {
++        discrepancies.push(
++          `${month} ${label}: ${actual}, should be ${shouldBe}`,
++        );
++      }
++    };
++
++    check('To Budget', readCell(month, 'to-budget'), figures.toBudget);
++    check('held', readCell(month, 'buffered-selected'), figures.held);
++    check('budgeted', -readCell(month, 'total-budgeted'), figures.budgeted);
++    check('spent', readCell(month, 'total-spent'), figures.spent);
++    check('income', readCell(month, 'total-income'), figures.income);
++
++    let balanceTotal = 0;
++    for (const [category, balance] of figures.balances) {
++      check(
++        `${category} balance`,
++        readCell(month, `leftover-${category}`),
++        balance,
++      );
++      balanceTotal += balance;
++    }
++    check('balance', readCell(month, 'total-leftover'), balanceTotal);
++
++    const { end } = monthUtils.bounds(month);
++    const cash = await db.first<{ amount: number | null }>(
++      `SELECT SUM(t.amount) AS amount FROM transactions t
++         JOIN accounts a ON a.id = t.acct
++        WHERE t.tombstone = 0 AND a.offbudget = 0 AND t.date <= ?`,
++      [end],
++    );
++    check(
++      'To Budget + held + balances against cash',
++      readCell(month, 'to-budget') +
++        readCell(month, 'buffered-selected') +
++        readCell(month, 'total-leftover'),
++      cash?.amount ?? 0,
++    );
++  }
++
++  return discrepancies;
++}
++
++// Merging adds what was budgeted for the merged categories to the remaining
++// one, exactly as it was entered, and moves their transactions to it. The
++// ledger then works the remaining category out like any other, so nothing
++// about the result is taken from the budget itself.
++async function mergeCategories(
++  ledger: Ledger,
++  merged: string[],
++  into: string,
++  merge: () => Promise<unknown>,
++): Promise<string[]> {
++  await merge();
++
++  const discrepancies: string[] = [];
++  for (const month of ledger.months) {
++    const entered = [...merged, into].reduce(
++      (total, category) => total + getBudgeted(ledger, month, category),
++      0,
++    );
++    ledger.budgeted.set(`${month}|${into}`, entered);
++
++    const row = await db.first<{ amount: number | null }>(
++      'SELECT amount FROM zero_budgets WHERE month = ? AND category = ?',
++      [parseInt(month.replace('-', '')), into],
++    );
++    if ((row?.amount ?? 0) !== entered) {
++      discrepancies.push(
++        `${month} ${into} budgeted after merging ${merged.join(', ')}: ` +
++          `${row?.amount ?? 0}, when ${entered} was entered`,
++      );
++    }
++  }
++  for (const transaction of ledger.transactions) {
++    if (merged.includes(transaction.category)) {
++      transaction.category = into;
++    }
++  }
++  merged.forEach(category => {
++    ledger.expense.delete(category);
++    ledger.income.delete(category);
++  });
++
++  return discrepancies;
++}
++
++async function runAction(
++  ledger: Ledger,
++  random: ReturnType<typeof createRandom>,
++): Promise<{ description: string; discrepancies: string[] }> {
++  const expense = [...ledger.expense];
++  const month =
++    random.next() < 0.15
++      ? random.pick(ledger.months.slice(-4))
++      : random.pick(ACTION_MONTHS);
++  const figures = computeMonths(ledger).get(month);
++  if (!figures) {
++    throw new Error(`No figures for ${month}`);
++  }
++  const balance = (category: string) => figures.balances.get(category) ?? 0;
++  const category = random.pick(expense);
++  const other = random.pick(expense.filter(id => id !== category));
++  const currencyCode = 'USD';
++  let discrepancies: string[] = [];
++  let description: string;
++
++  switch (random.upTo(21)) {
++    case 0: {
++      const amount = random.upTo(60000);
++      description = `budget ${amount} for ${category} in ${month}`;
++      await runHandler(handlers['budget/budget-amount'], {
++        month,
++        category,
++        amount,
++      });
++      ledger.budgeted.set(`${month}|${category}`, amount);
++      break;
++    }
++    case 1: {
++      const amount = 1 + random.upTo(9000);
++      description = `move ${amount} from ${category} to ${other} in ${month}`;
++      await runHandler(handlers['budget/transfer-category'], {
++        month,
++        amount,
++        from: category,
++        to: other,
++        currencyCode,
++      });
++      addBudgeted(ledger, month, category, -amount);
++      addBudgeted(ledger, month, other, amount);
++      break;
++    }
++    case 2: {
++      const amount = 1 + random.upTo(9000);
++      description = `move ${amount} from ${category} to To Budget in ${month}`;
++      await runHandler(handlers['budget/transfer-category'], {
++        month,
++        amount,
++        from: category,
++        to: 'to-budget',
++        currencyCode,
++      });
++      addBudgeted(ledger, month, category, -amount);
++      break;
++    }
++    case 3: {
++      description = `cover ${category} from ${other} in ${month}`;
++      await runHandler(handlers['budget/cover-overspending'], {
++        month,
++        to: category,
++        from: other,
++        currencyCode,
++      });
++      // As much of the overspending as the other category has
++      if (balance(category) < 0 && balance(other) > 0) {
++        const amount = Math.min(-balance(category), balance(other));
++        addBudgeted(ledger, month, other, -amount);
++        addBudgeted(ledger, month, category, amount);
++      }
++      break;
++    }
++    case 4: {
++      description = `cover ${category} from To Budget in ${month}`;
++      await runHandler(handlers['budget/cover-overspending'], {
++        month,
++        to: category,
++        from: 'to-budget',
++        currencyCode,
++      });
++      if (balance(category) < 0 && figures.toBudget > 0) {
++        addBudgeted(
++          ledger,
++          month,
++          category,
++          Math.min(-balance(category), figures.toBudget),
++        );
++      }
++      break;
++    }
++    case 5:
++    case 6: {
++      const amount = 1 + random.upTo(400000);
++      description = `hold ${amount} in ${month}`;
++      await runHandler(handlers['budget/hold-for-next-month'], {
++        month,
++        amount,
++      });
++      // That much more is held, as far as there is anything left to budget
++      if (figures.toBudget > 0) {
++        ledger.held.set(
++          month,
++          figures.held + Math.min(amount, figures.toBudget),
++        );
++      }
++      break;
++    }
++    case 7: {
++      description = `stop holding in ${month}`;
++      await runHandler(handlers['budget/reset-hold'], { month });
++      ledger.held.set(month, 0);
++      break;
++    }
++    case 8: {
++      const amount = 1 + random.upTo(50000);
++      description = `move ${amount} from To Budget to ${category} in ${month}`;
++      await runHandler(handlers['budget/transfer-available'], {
++        month,
++        amount,
++        category,
++      });
++      addBudgeted(
++        ledger,
++        month,
++        category,
++        Math.max(Math.min(amount, figures.toBudget), 0),
++      );
++      break;
++    }
++    case 9: {
++      const flag = random.next() < 0.6;
++      description = `roll over overspending of ${category} from ${month}: ${flag}`;
++      await runHandler(handlers['budget/set-carryover'], {
++        startMonth: month,
++        category,
++        flag,
++      });
++      ledger.rollover.set(category, [
++        ...(ledger.rollover.get(category) ?? []),
++        [month, flag],
++      ]);
++      break;
++    }
++    case 10: {
++      const incomeCategory = random.pick([...ledger.income]);
++      const flag = random.next() < 0.7;
++      description = `hold ${incomeCategory} automatically from ${month}: ${flag}`;
++      await runHandler(handlers['budget/set-carryover'], {
++        startMonth: month,
++        category: incomeCategory,
++        flag,
++      });
++      // Only for the months there are at this point
++      for (const laterMonth of ledger.months.filter(m => m >= month)) {
++        ledger.autoHold.set(`${laterMonth}|${incomeCategory}`, flag);
++      }
++      break;
++    }
++    case 11: {
++      if (expense.length < 4) {
++        description = 'nothing';
++        break;
++      }
++      description = `merge ${category} into ${other}`;
++      discrepancies = await mergeCategories(ledger, [category], other, () =>
++        runHandler(handlers['category-delete'], {
++          id: category,
++          transferId: other,
++        }),
++      );
++      break;
++    }
++    case 12: {
++      const groups = await db.getCategoriesGrouped();
++      const group = random.pick(groups.filter(g => !g.is_income));
++      const inGroup = group.categories.map(c => c.id);
++      const outside = expense.filter(id => !inGroup.includes(id));
++      if (outside.length < 3 || inGroup.length === 0) {
++        description = 'nothing';
++        break;
++      }
++      const into = random.pick(outside);
++      description = `delete group ${group.id}, merging ${inGroup.join(', ')} into ${into}`;
++      discrepancies = await mergeCategories(ledger, inGroup, into, () =>
++        runHandler(handlers['category-group-delete'], {
++          id: group.id,
++          transferId: into,
++        }),
++      );
++      break;
++    }
++    case 13: {
++      const amount = -random.upTo(30000);
++      description = `spend ${amount} on ${category} in ${month}`;
++      await addTransaction(
++        ledger,
++        month,
++        amount,
++        category,
++        random.pick(['checking', 'business']),
++      );
++      break;
++    }
++    case 14: {
++      description = `copy last month's budget to ${month}`;
++      await runHandler(handlers['budget/copy-previous-month'], { month });
++      const previous = monthUtils.prevMonth(month);
++      for (const id of expense) {
++        ledger.budgeted.set(
++          `${month}|${id}`,
++          getBudgeted(ledger, previous, id),
++        );
++      }
++      break;
++    }
++    case 15: {
++      description = `set budgets to zero in ${month}`;
++      await runHandler(handlers['budget/set-zero'], { month });
++      for (const id of expense) {
++        ledger.budgeted.set(`${month}|${id}`, 0);
++      }
++      break;
++    }
++    case 16:
++    case 17: {
++      // Into any group, the income group included. No figure depends on it.
++      const groups = await db.getCategoriesGrouped();
++      const group = random.pick(groups);
++      const id =
++        random.next() < 0.75 ? category : random.pick([...ledger.income]);
++      description = `move ${id} to group ${group.id}`;
++      await runHandler(handlers['category-move'], {
++        id,
++        groupId: group.id,
++        targetId: null,
++      });
++      break;
++    }
++    case 18:
++    case 19: {
++      // Now and then of the other kind than its group, as an import can
++      const groups = await db.getCategoriesGrouped();
++      const group = random.pick(groups);
++      const isIncome =
++        random.next() < 0.4 ? group.is_income !== 1 : group.is_income === 1;
++      const id = await runHandler(handlers['category-create'], {
++        name: `new-${random.upTo(1000000000)}`,
++        groupId: group.id,
++        isIncome,
++      });
++      (isIncome ? ledger.income : ledger.expense).add(id);
++      description = `create ${isIncome ? 'income' : 'expense'} category ${id} in ${group.id}`;
++      break;
++    }
++    default: {
++      const lastMonth = ledger.months[ledger.months.length - 1];
++      description = `budget 100 for ${category} in ${lastMonth}, adding months`;
++      await runHandler(handlers['budget/budget-amount'], {
++        month: lastMonth,
++        category,
++        amount: 100,
++      });
++      ledger.budgeted.set(`${lastMonth}|${category}`, 100);
++      await createAllBudgets();
++      ledger.months = getCreatedMonths();
++    }
++  }
++
++  return {
++    description,
++    discrepancies: [...discrepancies, ...(await findDiscrepancies(ledger))],
++  };
++}
++
++beforeEach(global.emptyDatabase());
++
++describe('Envelope budget against an independent ledger', () => {
++  it.each(Array.from({ length: SEEDS }, (_, index) => index + 1))(
++    'balances after every action of random sequence %i',
++    async seed => {
++      const ledger = createLedger();
++      const random = createRandom(seed);
++      await setUpBudget(ledger);
++      expect(await findDiscrepancies(ledger)).toEqual([]);
++      await sheet.waitOnSpreadsheet();
++      const start = snapshotDatabase();
++
++      const actions: string[] = [];
++      for (let step = 0; step < STEPS; step++) {
++        const { description, discrepancies } = await runAction(ledger, random);
++        actions.push(description);
++        expect({ actions, discrepancies }).toEqual({
++          actions,
++          discrepancies: [],
++        });
++      }
++
++      // And once more with the budget built from scratch
++      await sheet.waitOnSpreadsheet();
++      sheet.unloadSpreadsheet();
++      await sheet.loadSpreadsheet(db);
++      await createAllBudgets();
++      ledger.months = getCreatedMonths();
++      expect({
++        actions,
++        discrepancies: await findDiscrepancies(ledger),
++      }).toEqual({ actions, discrepancies: [] });
++
++      // And with everything delivered to the budget as it started out in one
++      // sync, the way a device that was offline receives it
++      await sheet.waitOnSpreadsheet();
++      await replayChangesAsOneSync(start, async () => {
++        sheet.unloadSpreadsheet();
++        await sheet.loadSpreadsheet(db);
++        await createAllBudgets();
++        await sheet.waitOnSpreadsheet();
++      });
++      await createAllBudgets();
++      ledger.months = getCreatedMonths();
++      expect({
++        actions,
++        discrepancies: await findDiscrepancies(ledger),
++      }).toEqual({ actions, discrepancies: [] });
++    },
++  );
++});
+diff --git a/packages/loot-core/src/server/budget/envelope.ts b/packages/loot-core/src/server/budget/envelope.ts
+index 1e7695a82..a3078be3e 100644
+--- a/packages/loot-core/src/server/budget/envelope.ts
++++ b/packages/loot-core/src/server/budget/envelope.ts
+@@ -6,7 +6,16 @@ import * as monthUtils from '#shared/months';
+ import { safeNumber } from '#shared/util';
+ 
+ import { createCategory as createCategoryFromBase } from './base';
+-import { flatten2, number, sumAmounts, unflatten2 } from './util';
++import {
++  flatten2,
++  getIncomeGroupIds,
++  getInheritedCarryover,
++  getMisfiledCategories,
++  isFiledUnderOwnKind,
++  number,
++  sumAmounts,
++  unflatten2,
++} from './util';
+ 
+ function getBlankSheet(months) {
+   const blankMonth = monthUtils.prevMonth(months[0]);
+@@ -43,7 +52,13 @@ export function createCategory(cat, sheetName, prevSheetName) {
+       sheet.get().set(resolveName(sheetName, `budget-${cat.id}`), 0);
+     }
+ 
+-    sheet.get().createStatic(sheetName, `carryover-${cat.id}`, false);
++    sheet
++      .get()
++      .createStatic(
++        sheetName,
++        `carryover-${cat.id}`,
++        getInheritedCarryover(cat, prevSheetName),
++      );
+ 
+     sheet.get().createDynamic(sheetName, `leftover-${cat.id}`, {
+       initialValue: 0,
+@@ -74,22 +89,26 @@ export function createCategory(cat, sheetName, prevSheetName) {
+ }
+ 
+ export function createCategoryGroup(group, sheetName) {
++  const categories = group.categories.filter(cat =>
++    isFiledUnderOwnKind(cat, group),
++  );
++
+   sheet.get().createDynamic(sheetName, 'group-sum-amount-' + group.id, {
+     initialValue: 0,
+-    dependencies: group.categories.map(cat => `sum-amount-${cat.id}`),
++    dependencies: categories.map(cat => `sum-amount-${cat.id}`),
+     run: sumAmounts,
+   });
+ 
+   if (!group.is_income) {
+     sheet.get().createDynamic(sheetName, 'group-budget-' + group.id, {
+       initialValue: 0,
+-      dependencies: group.categories.map(cat => `budget-${cat.id}`),
++      dependencies: categories.map(cat => `budget-${cat.id}`),
+       run: sumAmounts,
+     });
+ 
+     sheet.get().createDynamic(sheetName, 'group-leftover-' + group.id, {
+       initialValue: 0,
+-      dependencies: group.categories.map(cat => `leftover-${cat.id}`),
++      dependencies: categories.map(cat => `leftover-${cat.id}`),
+       run: sumAmounts,
+     });
+   }
+@@ -99,6 +118,8 @@ export function createSummary(groups, categories, prevSheetName, sheetName) {
+   const incomeGroup = groups.filter(group => group.is_income)[0];
+   const expenseCategories = categories.filter(cat => !cat.is_income);
+   const incomeCategories = categories.filter(cat => cat.is_income);
++  const misfiledIncome = getMisfiledCategories(groups, { isIncome: true });
++  const misfiledExpenses = getMisfiledCategories(groups, { isIncome: false });
+ 
+   sheet.get().createStatic(sheetName, 'buffered', 0);
+ 
+@@ -112,11 +133,14 @@ export function createSummary(groups, categories, prevSheetName, sheetName) {
+       safeNumber(number(toBudget) + number(buffered)),
+   });
+ 
+-  // Alias the group income total to `total-income`
++  // The income group's total, and any income filed in another group
+   sheet.get().createDynamic(sheetName, 'total-income', {
+     initialValue: 0,
+-    dependencies: [`group-sum-amount-${incomeGroup.id}`],
+-    run: amount => amount,
++    dependencies: [
++      `group-sum-amount-${incomeGroup.id}`,
++      ...misfiledIncome.map(cat => `sum-amount-${cat.id}`),
++    ],
++    run: sumAmounts,
+   });
+ 
+   sheet.get().createDynamic(sheetName, 'available-funds', {
+@@ -149,9 +173,12 @@ export function createSummary(groups, categories, prevSheetName, sheetName) {
+ 
+   sheet.get().createDynamic(sheetName, 'total-budgeted', {
+     initialValue: 0,
+-    dependencies: groups
+-      .filter(group => !group.is_income)
+-      .map(group => `group-budget-${group.id}`),
++    dependencies: [
++      ...groups
++        .filter(group => !group.is_income)
++        .map(group => `group-budget-${group.id}`),
++      ...misfiledExpenses.map(cat => `budget-${cat.id}`),
++    ],
+     run: (...amounts) => {
+       // Negate budgeted amount
+       return -sumAmounts(...amounts);
+@@ -210,17 +237,23 @@ export function createSummary(groups, categories, prevSheetName, sheetName) {
+ 
+   sheet.get().createDynamic(sheetName, 'total-spent', {
+     initialValue: 0,
+-    dependencies: groups
+-      .filter(group => !group.is_income)
+-      .map(group => `group-sum-amount-${group.id}`),
++    dependencies: [
++      ...groups
++        .filter(group => !group.is_income)
++        .map(group => `group-sum-amount-${group.id}`),
++      ...misfiledExpenses.map(cat => `sum-amount-${cat.id}`),
++    ],
+     run: sumAmounts,
+   });
+ 
+   sheet.get().createDynamic(sheetName, 'total-leftover', {
+     initialValue: 0,
+-    dependencies: groups
+-      .filter(group => !group.is_income)
+-      .map(group => `group-leftover-${group.id}`),
++    dependencies: [
++      ...groups
++        .filter(group => !group.is_income)
++        .map(group => `group-leftover-${group.id}`),
++      ...misfiledExpenses.map(cat => `leftover-${cat.id}`),
++    ],
+     run: sumAmounts,
+   });
+ }
+@@ -238,88 +271,117 @@ export function createBudget(meta, categories, months) {
+ }
+ 
+ export function handleCategoryChange(months, oldValue, newValue) {
+-  // Build list of cells and dependencies that need updated
+-  function getDeps(sheetName, prevSheetName, groupId, cat) {
+-    const deps: Array<[string, string[]]> = [
+-      [`group-sum-amount-${groupId}`, [`sum-amount-${cat.id}`]],
+-      [`group-budget-${groupId}`, [`budget-${cat.id}`]],
+-      [`group-leftover-${groupId}`, [`leftover-${cat.id}`]],
++  type Deps = Array<[string, string[]]>;
++
++  let incomeGroupIds: Set<string> | null = null;
++  function isIncomeGroup(groupId): boolean {
++    incomeGroupIds ??= getIncomeGroupIds();
++    return incomeGroupIds.has(groupId);
++  }
++
++  // The totals a category in the given group is added up in: those of the
++  // group, or the month's own when it is filed in a group of the other kind
++  // (see `isFiledUnderOwnKind`)
++  function getGroupDeps(groupId, cat): Deps {
++    if (isIncomeGroup(groupId) === Boolean(cat.is_income)) {
++      return [
++        [`group-sum-amount-${groupId}`, [`sum-amount-${cat.id}`]],
++        [`group-budget-${groupId}`, [`budget-${cat.id}`]],
++        [`group-leftover-${groupId}`, [`leftover-${cat.id}`]],
++      ];
++    }
++
++    if (cat.is_income) {
++      return [['total-income', [`sum-amount-${cat.id}`]]];
++    }
++
++    return [
++      ['total-budgeted', [`budget-${cat.id}`]],
++      ['total-spent', [`sum-amount-${cat.id}`]],
++      ['total-leftover', [`leftover-${cat.id}`]],
+     ];
++  }
+ 
++  // The cells totalling every category, whichever group it is in
++  function getSummaryDeps(sheetName, prevSheetName, cat): Deps {
+     if (cat.is_income) {
+-      deps.push([
+-        'buffered-auto',
++      return [
+         [
+-          `${sheetName}!sum-amount-${cat.id}`,
+-          `${sheetName}!carryover-${cat.id}`,
++          'buffered-auto',
++          [
++            `${sheetName}!sum-amount-${cat.id}`,
++            `${sheetName}!carryover-${cat.id}`,
++          ],
+         ],
+-      ]);
+-    } else {
+-      deps.push([
++      ];
++    }
++
++    return [
++      [
+         'last-month-overspent',
+         [
+           `${prevSheetName}!leftover-${cat.id}`,
+           `${prevSheetName}!carryover-${cat.id}`,
+         ],
+-      ]);
+-    }
+-
+-    return deps;
++      ],
++    ];
+   }
+ 
+-  function addDeps(sheetName, prevSheetName, groupId, cat) {
+-    getDeps(sheetName, prevSheetName, groupId, cat).forEach(
+-      ([cellName, deps]) => {
+-        sheet.get().addDependencies(sheetName, cellName, deps);
+-      },
+-    );
++  function addDeps(sheetName, deps: Deps) {
++    deps.forEach(([cellName, cellDeps]) => {
++      sheet.get().addDependencies(sheetName, cellName, cellDeps);
++    });
+   }
+ 
+-  function removeDeps(sheetName, prevSheetName, groupId, cat) {
+-    getDeps(sheetName, prevSheetName, groupId, cat).forEach(
+-      ([cellName, deps]) => {
+-        sheet.get().removeDependencies(sheetName, cellName, deps);
+-      },
+-    );
++  function removeDeps(sheetName, deps: Deps) {
++    deps.forEach(([cellName, cellDeps]) => {
++      sheet.get().removeDependencies(sheetName, cellName, cellDeps);
++    });
+   }
+ 
+-  if (oldValue && oldValue.tombstone === 0 && newValue.tombstone === 1) {
+-    months.forEach(month => {
+-      const prevSheetName = monthUtils.sheetForMonth(
+-        monthUtils.prevMonth(month),
+-      );
+-      const sheetName = monthUtils.sheetForMonth(month);
++  // Several changes to a category can arrive at once: a sync delivers
++  // everything another device did since the last one, so a category can be
++  // both moved and deleted here. Compare where it was counted with where it
++  // belongs now instead of handling one kind of change.
++  const wasAlive = oldValue != null && oldValue.tombstone === 0;
++  const isAlive = newValue.tombstone === 0;
++  const hasMoved =
++    wasAlive && isAlive && oldValue.cat_group !== newValue.cat_group;
++
++  if (wasAlive === isAlive && !hasMoved) {
++    return;
++  }
+ 
+-      removeDeps(sheetName, prevSheetName, newValue.cat_group, newValue);
+-    });
+-  } else if (
+-    newValue.tombstone === 0 &&
+-    (!oldValue || oldValue.tombstone === 1)
+-  ) {
++  if (isAlive && !wasAlive) {
+     createBlankCategory(newValue, months);
++  }
+ 
+-    months.forEach(month => {
+-      const prevMonth = monthUtils.prevMonth(month);
+-      const prevSheetName = monthUtils.sheetForMonth(prevMonth);
+-      const sheetName = monthUtils.sheetForMonth(month);
+-      const { start, end } = monthUtils.bounds(month);
++  // Oldest first: a month's cells can depend on the month before it
++  [...(months as Set<string>)].sort().forEach(month => {
++    const prevMonth = monthUtils.prevMonth(month);
++    const prevSheetName = monthUtils.sheetForMonth(prevMonth);
++    const sheetName = monthUtils.sheetForMonth(month);
++    const summaryDeps = getSummaryDeps(sheetName, prevSheetName, newValue);
+ 
++    if (wasAlive) {
++      // It was counted in the group it was in before this change, which
++      // isn't the group it has now if it also moved
++      removeDeps(sheetName, getGroupDeps(oldValue.cat_group, newValue));
++
++      if (!isAlive) {
++        removeDeps(sheetName, summaryDeps);
++      }
++    } else {
++      const { start, end } = monthUtils.bounds(month);
+       createCategoryFromBase(newValue, sheetName, prevSheetName, start, end);
+ 
+-      addDeps(sheetName, prevSheetName, newValue.cat_group, newValue);
+-    });
+-  } else if (oldValue && oldValue.cat_group !== newValue.cat_group) {
+-    // The category moved so we need to update the dependencies
+-    months.forEach(month => {
+-      const prevSheetName = monthUtils.sheetForMonth(
+-        monthUtils.prevMonth(month),
+-      );
+-      const sheetName = monthUtils.sheetForMonth(month);
++      addDeps(sheetName, summaryDeps);
++    }
+ 
+-      removeDeps(sheetName, prevSheetName, oldValue.cat_group, newValue);
+-      addDeps(sheetName, prevSheetName, newValue.cat_group, newValue);
+-    });
+-  }
++    if (isAlive) {
++      addDeps(sheetName, getGroupDeps(newValue.cat_group, newValue));
++    }
++  });
+ }
+ 
+ export function handleCategoryGroupChange(months, oldValue, newValue) {
+diff --git a/packages/loot-core/src/server/budget/tracking-balance.test.ts b/packages/loot-core/src/server/budget/tracking-balance.test.ts
+new file mode 100644
+index 000000000..91094d0b2
+--- /dev/null
++++ b/packages/loot-core/src/server/budget/tracking-balance.test.ts
+@@ -0,0 +1,377 @@
++import * as db from '#server/db';
++import { runHandler } from '#server/mutators';
++import * as sheet from '#server/sheet';
++
++import {
++  copyPreviousMonth,
++  getSheetValue,
++  setBudget,
++  setCategoryCarryover,
++} from './actions';
++import { app } from './app';
++import * as budget from './base';
++
++// The figures of a tracking budget worked out by hand, month by month. The
++// expected amounts are written out rather than taken from the budget
++// recalculating itself, which would agree with itself whether or not it is
++// right.
++//
++//                     January              February            March
++//   Sales             5,000 budgeted       5,000 budgeted      -
++//                     5,200 received       4,800 received
++//   Grants            200 budgeted         -                   -
++//   Rent (premises)   1,000 / 1,000 spent  1,000 / 1,000       -
++//   Power (premises)  120 / 150 spent      120 / 100           -
++//                     = -30.00             = 20.00
++//   Stock (trading)   1,500 / 1,400 spent  1,500 / 1,650       -
++//                     = 100.00             = -150.00
++//
++//   Budgeted income   5,200.00             5,000.00            0
++//   Received          5,200.00             4,800.00            0
++//   Budgeted expenses 2,620.00             2,620.00            0
++//   Spent             2,550.00             2,750.00            0
++//   Projected savings 2,580.00             2,380.00            0
++//   Saved             2,650.00             2,050.00            0
++//
++// Nothing carries from one month to the next unless a category rolls over.
++
++const MONTHS = ['2024-01', '2024-02', '2024-03'];
++
++async function loadBudget(months = MONTHS) {
++  await sheet.loadSpreadsheet(db);
++  sheet.get().meta().budgetType = 'tracking';
++  await budget.createBudget(months);
++}
++
++async function value(month: string, cell: string) {
++  await sheet.waitOnSpreadsheet();
++  return getSheetValue(`budget${month.replace('-', '')}`, cell);
++}
++
++async function eachMonth(cell: string) {
++  const amounts: number[] = [];
++  for (const month of [...sheet.get().meta().createdMonths].sort()) {
++    amounts.push(await value(month, cell));
++  }
++  return amounts;
++}
++
++async function summary(month: string) {
++  return {
++    budgetedIncome: await value(month, 'total-budget-income'),
++    received: await value(month, 'total-income'),
++    budgetedExpenses: await value(month, 'total-budgeted'),
++    spent: await value(month, 'total-spent'),
++    projectedSavings: await value(month, 'total-saved'),
++    saved: await value(month, 'real-saved'),
++  };
++}
++
++const JANUARY = {
++  budgetedIncome: 520000,
++  received: 520000,
++  budgetedExpenses: 262000,
++  spent: -255000,
++  projectedSavings: 258000,
++  saved: 265000,
++};
++
++const FEBRUARY = {
++  budgetedIncome: 500000,
++  received: 480000,
++  budgetedExpenses: 262000,
++  spent: -275000,
++  projectedSavings: 238000,
++  saved: 205000,
++};
++
++beforeEach(async () => {
++  await global.emptyDatabase()();
++  db.runQuery(
++    "INSERT INTO preferences (id, value) VALUES ('budgetType', 'tracking')",
++  );
++
++  await db.insertAccount({ id: 'current', name: 'Current' });
++  await db.insertCategoryGroup({ id: 'income', name: 'Income', is_income: 1 });
++  for (const id of ['sales', 'grants']) {
++    await db.insertCategory({
++      id,
++      name: id,
++      cat_group: 'income',
++      is_income: 1,
++    });
++  }
++  await db.insertCategoryGroup({ id: 'premises', name: 'Premises' });
++  await db.insertCategory({ id: 'rent', name: 'rent', cat_group: 'premises' });
++  await db.insertCategory({
++    id: 'power',
++    name: 'power',
++    cat_group: 'premises',
++  });
++  await db.insertCategoryGroup({ id: 'trading', name: 'Trading' });
++  await db.insertCategory({ id: 'stock', name: 'stock', cat_group: 'trading' });
++
++  for (const [date, amount, category] of [
++    ['2024-01-05', 520000, 'sales'],
++    ['2024-01-06', -100000, 'rent'],
++    ['2024-01-07', -15000, 'power'],
++    ['2024-01-08', -140000, 'stock'],
++    ['2024-02-05', 480000, 'sales'],
++    ['2024-02-06', -100000, 'rent'],
++    ['2024-02-07', -10000, 'power'],
++    ['2024-02-08', -165000, 'stock'],
++  ] as const) {
++    await db.insertTransaction({ date, amount, category, account: 'current' });
++  }
++
++  await loadBudget();
++
++  for (const month of ['2024-01', '2024-02']) {
++    await setBudget({ category: 'sales', month, amount: 500000 });
++    await setBudget({ category: 'rent', month, amount: 100000 });
++    await setBudget({ category: 'power', month, amount: 12000 });
++    await setBudget({ category: 'stock', month, amount: 150000 });
++  }
++  await setBudget({ category: 'grants', month: '2024-01', amount: 20000 });
++});
++
++describe('Tracking budget balance', () => {
++  it('starts from the figures worked out by hand', async () => {
++    expect(await summary('2024-01')).toEqual(JANUARY);
++    expect(await summary('2024-02')).toEqual(FEBRUARY);
++
++    expect(await eachMonth('leftover-rent')).toEqual([0, 0, 0]);
++    expect(await eachMonth('leftover-power')).toEqual([-3000, 2000, 0]);
++    expect(await eachMonth('leftover-stock')).toEqual([10000, -15000, 0]);
++    // Budgeted less received
++    expect(await eachMonth('leftover-sales')).toEqual([-20000, 20000, 0]);
++    expect(await eachMonth('leftover-grants')).toEqual([20000, 0, 0]);
++
++    expect(await eachMonth('group-budget-premises')).toEqual([
++      112000, 112000, 0,
++    ]);
++    expect(await eachMonth('group-sum-amount-premises')).toEqual([
++      -115000, -110000, 0,
++    ]);
++    expect(await eachMonth('group-leftover-premises')).toEqual([
++      -3000, 2000, 0,
++    ]);
++    expect(await eachMonth('total-leftover')).toEqual([7000, -13000, 0]);
++  });
++
++  describe('rolling over', () => {
++    const LATER_MONTHS = [...MONTHS, '2024-04', '2024-05'];
++
++    beforeEach(async () => {
++      await setCategoryCarryover({
++        startMonth: '2024-01',
++        category: 'power',
++        flag: true,
++      });
++    });
++
++    it('carries the balance of the category and changes no total', async () => {
++      // -30.00 + 20.00, which then stays
++      expect(await eachMonth('leftover-power')).toEqual([-3000, -1000, -1000]);
++      expect(await eachMonth('group-leftover-premises')).toEqual([
++        -3000, -1000, -1000,
++      ]);
++      expect(await summary('2024-01')).toEqual(JANUARY);
++      expect(await summary('2024-02')).toEqual(FEBRUARY);
++    });
++
++    it('keeps rolling over in months added to the budget later', async () => {
++      await budget.createBudget(LATER_MONTHS);
++
++      expect(await eachMonth('leftover-power')).toEqual([
++        -3000, -1000, -1000, -1000, -1000,
++      ]);
++    });
++
++    it('keeps rolling over once something is budgeted in such a month', async () => {
++      await budget.createBudget(LATER_MONTHS);
++      await setBudget({ category: 'power', month: '2024-04', amount: 400 });
++      await sheet.waitOnSpreadsheet();
++
++      expect(await eachMonth('leftover-power')).toEqual([
++        -3000, -1000, -1000, -600, -600,
++      ]);
++
++      sheet.unloadSpreadsheet();
++      await loadBudget(LATER_MONTHS);
++      expect(await eachMonth('leftover-power')).toEqual([
++        -3000, -1000, -1000, -600, -600,
++      ]);
++    });
++  });
++
++  describe('hiding', () => {
++    it('leaves a hidden category out of its group and the month', async () => {
++      await db.update('categories', { id: 'power', hidden: 1 });
++
++      expect(await value('2024-01', 'group-budget-premises')).toBe(100000);
++      expect(await value('2024-01', 'group-sum-amount-premises')).toBe(-100000);
++      expect(await summary('2024-01')).toEqual({
++        ...JANUARY,
++        budgetedExpenses: 250000,
++        spent: -240000,
++        projectedSavings: 270000,
++        saved: 280000,
++      });
++    });
++
++    it('keeps a hidden category out of the group it is moved to', async () => {
++      await db.update('categories', { id: 'power', hidden: 1 });
++      await db.moveCategory('power', 'trading', null);
++
++      expect(await value('2024-01', 'group-budget-trading')).toBe(150000);
++      expect(await value('2024-01', 'total-budgeted')).toBe(250000);
++
++      await db.update('categories', { id: 'power', hidden: 0 });
++      expect(await value('2024-01', 'group-budget-trading')).toBe(162000);
++      expect(await value('2024-01', 'group-budget-premises')).toBe(100000);
++      expect(await summary('2024-01')).toEqual(JANUARY);
++    });
++
++    it('leaves a hidden group out of the month', async () => {
++      await db.update('category_groups', { id: 'trading', hidden: 1 });
++
++      expect(await summary('2024-01')).toEqual({
++        ...JANUARY,
++        budgetedExpenses: 112000,
++        spent: -115000,
++        projectedSavings: 408000,
++        saved: 405000,
++      });
++
++      await db.update('category_groups', { id: 'trading', hidden: 0 });
++      expect(await summary('2024-01')).toEqual(JANUARY);
++    });
++
++    it('never counts income as an expense when the income group is hidden and shown', async () => {
++      await db.update('category_groups', { id: 'income', hidden: 1 });
++      await db.update('category_groups', { id: 'income', hidden: 0 });
++
++      expect(await summary('2024-01')).toEqual(JANUARY);
++      expect(await summary('2024-02')).toEqual(FEBRUARY);
++    });
++  });
++
++  describe('merging a category into another', () => {
++    it('adds up what was budgeted and spent and changes no total', async () => {
++      await runHandler(app.handlers['category-delete'], {
++        id: 'power',
++        transferId: 'rent',
++      });
++
++      expect(await eachMonth('budget-rent')).toEqual([112000, 112000, 0]);
++      expect(await eachMonth('sum-amount-rent')).toEqual([-115000, -110000, 0]);
++      expect(await eachMonth('leftover-rent')).toEqual([-3000, 2000, 0]);
++      expect(await summary('2024-01')).toEqual(JANUARY);
++      expect(await summary('2024-02')).toEqual(FEBRUARY);
++    });
++
++    it('moves budgeted income to the income category taking its place', async () => {
++      await runHandler(app.handlers['category-delete'], {
++        id: 'grants',
++        transferId: 'sales',
++      });
++
++      // 5,000.00 + 200.00 budgeted against 5,200.00 received
++      expect(await eachMonth('budget-sales')).toEqual([520000, 500000, 0]);
++      expect(await eachMonth('leftover-sales')).toEqual([0, 20000, 0]);
++      expect(await summary('2024-01')).toEqual(JANUARY);
++      expect(await summary('2024-02')).toEqual(FEBRUARY);
++    });
++
++    it('changes no total when a group is deleted into another category', async () => {
++      await runHandler(app.handlers['category-group-delete'], {
++        id: 'premises',
++        transferId: 'stock',
++      });
++
++      expect(await eachMonth('budget-stock')).toEqual([262000, 262000, 0]);
++      expect(await eachMonth('leftover-stock')).toEqual([7000, -13000, 0]);
++      expect(await summary('2024-01')).toEqual(JANUARY);
++      expect(await summary('2024-02')).toEqual(FEBRUARY);
++    });
++  });
++
++  // The screens only file a category under a group of its own kind, but the
++  // API or an import can leave an expense category in the income group. It
++  // is still an expense: what is spent in it must not come off the income.
++  describe('a category filed under a group of the other kind', () => {
++    it('changes no total when an expense category is moved into the income group', async () => {
++      await db.moveCategory('power', 'income', null);
++
++      expect(await summary('2024-01')).toEqual(JANUARY);
++      expect(await summary('2024-02')).toEqual(FEBRUARY);
++      expect(await eachMonth('leftover-power')).toEqual([-3000, 2000, 0]);
++      expect(await eachMonth('total-leftover')).toEqual([7000, -13000, 0]);
++      // Each group only adds up its own kind
++      expect(await value('2024-01', 'group-budget-income')).toBe(520000);
++      expect(await value('2024-01', 'group-sum-amount-income')).toBe(520000);
++      expect(await value('2024-01', 'group-budget-premises')).toBe(100000);
++      expect(await value('2024-01', 'group-sum-amount-premises')).toBe(-100000);
++    });
++
++    it('shows the same after the budget is loaded again', async () => {
++      await db.moveCategory('power', 'income', null);
++      await sheet.waitOnSpreadsheet();
++
++      sheet.unloadSpreadsheet();
++      await loadBudget();
++
++      expect(await summary('2024-01')).toEqual(JANUARY);
++      expect(await summary('2024-02')).toEqual(FEBRUARY);
++      expect(await value('2024-01', 'group-budget-income')).toBe(520000);
++    });
++
++    it('counts it in its group again once it is moved back', async () => {
++      await db.moveCategory('power', 'income', null);
++      await db.moveCategory('power', 'premises', null);
++
++      expect(await summary('2024-01')).toEqual(JANUARY);
++      expect(await value('2024-01', 'group-budget-premises')).toBe(112000);
++      expect(await value('2024-01', 'group-sum-amount-premises')).toBe(-115000);
++    });
++
++    it('still leaves it out of the month while it is hidden', async () => {
++      await db.moveCategory('power', 'income', null);
++      await db.update('categories', { id: 'power', hidden: 1 });
++
++      expect(await summary('2024-01')).toEqual({
++        ...JANUARY,
++        budgetedExpenses: 250000,
++        spent: -240000,
++        projectedSavings: 270000,
++        saved: 280000,
++      });
++
++      await db.update('categories', { id: 'power', hidden: 0 });
++      expect(await summary('2024-01')).toEqual(JANUARY);
++    });
++
++    it('counts income filed under an expense group as income', async () => {
++      await db.moveCategory('grants', 'premises', null);
++
++      expect(await summary('2024-01')).toEqual(JANUARY);
++      expect(await value('2024-01', 'group-budget-premises')).toBe(112000);
++      expect(await value('2024-01', 'group-budget-income')).toBe(500000);
++    });
++  });
++
++  describe("copying last month's budget", () => {
++    it('gives the month exactly what was budgeted the month before', async () => {
++      // Nothing was budgeted for grants in February
++      await setBudget({ category: 'grants', month: '2024-03', amount: 7000 });
++
++      await copyPreviousMonth({ month: '2024-03' });
++
++      expect(await value('2024-03', 'budget-grants')).toBe(0);
++      expect(await value('2024-03', 'total-budget-income')).toBe(500000);
++      expect(await value('2024-03', 'total-budgeted')).toBe(262000);
++      expect(await value('2024-03', 'total-saved')).toBe(238000);
++    });
++  });
++});
+diff --git a/packages/loot-core/src/server/budget/tracking-ledger.test.ts b/packages/loot-core/src/server/budget/tracking-ledger.test.ts
+new file mode 100644
+index 000000000..1a78e9586
+--- /dev/null
++++ b/packages/loot-core/src/server/budget/tracking-ledger.test.ts
+@@ -0,0 +1,710 @@
++import { replayChangesAsOneSync, snapshotDatabase } from '#mocks/sync-replay';
++import * as db from '#server/db';
++import { runHandler } from '#server/mutators';
++import * as sheet from '#server/sheet';
++import * as monthUtils from '#shared/months';
++
++import { app } from './app';
++import { createAllBudgets } from './base';
++
++// Runs random sequences of actions on a tracking budget and checks every
++// figure it shows against an independent ledger after each one.
++//
++// The ledger is told what each action is meant to do and works the months out
++// from the rules of a tracking budget alone, never from the budget
++// recalculating itself:
++//
++// - a category's balance is what was budgeted less what was spent (for
++//   income: what was budgeted less what was received). Nothing carries into
++//   the next month unless the category rolls over, and then its whole balance
++//   does
++// - a category is income or an expense by its own setting, wherever it is
++//   filed: the API or an import can leave an expense category in the income
++//   group, and what is spent in it is still spending, not negative income
++// - group totals add up the categories of the group that aren't hidden and
++//   are of the group's kind, and the month's totals add up the expense
++//   groups that aren't hidden plus any expense category filed under income
++// - projected savings are budgeted income less budgeted expenses, and what
++//   was saved is the income received less what was spent
++
++const handlers = app.handlers;
++
++const INCOME_GROUP = 'income';
++const FIRST_MONTHS = ['2016-10', '2016-11', '2016-12', '2017-01'];
++const ACTION_MONTHS = [...FIRST_MONTHS, '2017-02', '2017-03'];
++const SEEDS = Number(process.env.LEDGER_SEEDS || 40);
++const STEPS = Number(process.env.LEDGER_STEPS || 12);
++
++type Transaction = {
++  id: string;
++  month: string;
++  amount: number;
++  category: string;
++  account: string;
++};
++
++type Category = { group: string; isIncome: boolean; isHidden: boolean };
++
++type Ledger = {
++  months: string[];
++  categories: Map<string, Category>;
++  hiddenGroups: Set<string>;
++  onBudget: Map<string, boolean>;
++  transactions: Transaction[];
++  // `${month}|${category}` to the amount budgeted
++  budgeted: Map<string, number>;
++  // Rolling over is turned on or off from a month on
++  rollover: Map<string, Array<[string, boolean]>>;
++};
++
++function createLedger(): Ledger {
++  return {
++    months: [],
++    categories: new Map(),
++    hiddenGroups: new Set(),
++    onBudget: new Map(),
++    transactions: [],
++    budgeted: new Map(),
++    rollover: new Map(),
++  };
++}
++
++function getBudgeted(ledger: Ledger, month: string, category: string) {
++  return ledger.budgeted.get(`${month}|${category}`) ?? 0;
++}
++
++function getActivity(ledger: Ledger, month: string, category: string) {
++  return ledger.transactions
++    .filter(
++      t =>
++        t.month === month &&
++        t.category === category &&
++        ledger.onBudget.get(t.account),
++    )
++    .reduce((total, t) => total + t.amount, 0);
++}
++
++function rollsOver(ledger: Ledger, month: string, category: string) {
++  let isOn = false;
++  for (const [start, flag] of ledger.rollover.get(category) ?? []) {
++    if (month >= start) {
++      isOn = flag;
++    }
++  }
++  return isOn;
++}
++
++type Totals = { budgeted: number; activity: number; balance: number };
++
++type MonthFigures = {
++  categories: Map<string, Totals>;
++  groups: Map<string, Totals>;
++  budgetedExpenses: number;
++  spent: number;
++  expenseBalance: number;
++  budgetedIncome: number;
++  received: number;
++};
++
++function computeMonths(ledger: Ledger): Map<string, MonthFigures> {
++  const months = new Map<string, MonthFigures>();
++  const previousBalance = new Map<string, number>();
++  let previousMonth: string | null = null;
++
++  for (const month of ledger.months) {
++    const figures: MonthFigures = {
++      categories: new Map(),
++      groups: new Map(),
++      budgetedExpenses: 0,
++      spent: 0,
++      expenseBalance: 0,
++      budgetedIncome: 0,
++      received: 0,
++    };
++
++    for (const [id, category] of ledger.categories) {
++      const budgeted = getBudgeted(ledger, month, id);
++      const activity = getActivity(ledger, month, id);
++      const carried =
++        previousMonth != null &&
++        !category.isIncome &&
++        rollsOver(ledger, previousMonth, id)
++          ? (previousBalance.get(id) ?? 0)
++          : 0;
++      const balance = category.isIncome
++        ? budgeted - activity
++        : budgeted + activity + carried;
++      figures.categories.set(id, { budgeted, activity, balance });
++      previousBalance.set(id, balance);
++
++      if (category.isHidden) {
++        continue;
++      }
++
++      const isFiledUnderOwnKind =
++        category.isIncome === (category.group === INCOME_GROUP);
++      if (isFiledUnderOwnKind) {
++        const group = figures.groups.get(category.group) ?? {
++          budgeted: 0,
++          activity: 0,
++          balance: 0,
++        };
++        group.budgeted += budgeted;
++        group.activity += activity;
++        group.balance += balance;
++        figures.groups.set(category.group, group);
++      }
++
++      if (category.isIncome) {
++        figures.budgetedIncome += budgeted;
++        figures.received += activity;
++      } else if (
++        !isFiledUnderOwnKind ||
++        !ledger.hiddenGroups.has(category.group)
++      ) {
++        figures.budgetedExpenses += budgeted;
++        figures.spent += activity;
++        figures.expenseBalance += balance;
++      }
++    }
++
++    months.set(month, figures);
++    previousMonth = month;
++  }
++
++  return months;
++}
++
++function createRandom(seed: number) {
++  let state = seed >>> 0;
++  const next = () => {
++    state = (state * 1664525 + 1013904223) >>> 0;
++    return state / 4294967296;
++  };
++  return {
++    next,
++    upTo: (max: number) => Math.floor(next() * max),
++    pick: <T>(items: T[]): T => items[Math.floor(next() * items.length)],
++  };
++}
++
++function getCreatedMonths() {
++  return [...sheet.get().meta().createdMonths].sort();
++}
++
++async function addTransaction(
++  ledger: Ledger,
++  month: string,
++  amount: number,
++  category: string,
++  account: string,
++) {
++  const id = `transaction-${ledger.transactions.length}`;
++  await db.insertTransaction({
++    id,
++    date: `${month}-15`,
++    amount,
++    category,
++    account,
++  });
++  ledger.transactions.push({ id, month, amount, category, account });
++}
++
++async function setBudgeted(
++  ledger: Ledger,
++  month: string,
++  category: string,
++  amount: number,
++) {
++  await runHandler(handlers['budget/budget-amount'], {
++    month,
++    category,
++    amount,
++  });
++  ledger.budgeted.set(`${month}|${category}`, amount);
++}
++
++async function setUpBudget(ledger: Ledger) {
++  db.runQuery(
++    "INSERT INTO preferences (id, value) VALUES ('budgetType', 'tracking')",
++  );
++  await sheet.loadSpreadsheet(db);
++  sheet.get().meta().budgetType = 'tracking';
++
++  await db.insertCategoryGroup({
++    id: INCOME_GROUP,
++    name: 'Income',
++    is_income: 1,
++  });
++  for (const id of ['sales', 'interest', 'grants']) {
++    await db.insertCategory({
++      id,
++      name: id,
++      cat_group: INCOME_GROUP,
++      is_income: 1,
++    });
++    ledger.categories.set(id, {
++      group: INCOME_GROUP,
++      isIncome: true,
++      isHidden: false,
++    });
++  }
++
++  for (const [group, categories] of [
++    ['premises', ['rent', 'power', 'repairs']],
++    ['trading', ['stock', 'tools']],
++    ['other', ['fees', 'gifts']],
++  ] as const) {
++    await db.insertCategoryGroup({ id: group, name: group });
++    for (const id of categories) {
++      await db.insertCategory({ id, name: id, cat_group: group });
++      ledger.categories.set(id, { group, isIncome: false, isHidden: false });
++    }
++  }
++
++  for (const [id, offbudget] of [
++    ['current', 0],
++    ['card', 0],
++    ['loan', 1],
++  ] as const) {
++    await db.insertAccount({ id, name: id, offbudget });
++    ledger.onBudget.set(id, offbudget === 0);
++  }
++
++  for (const month of FIRST_MONTHS) {
++    for (const [amount, category, account] of [
++      [500000, 'sales', 'current'],
++      [1200, 'interest', 'current'],
++      [-100000, 'rent', 'current'],
++      [-14000, 'power', 'current'],
++      [-7000, 'repairs', 'card'],
++      [-160000, 'stock', 'card'],
++      [-9000, 'tools', 'card'],
++      [-1500, 'fees', 'current'],
++      [-2500, 'gifts', 'loan'],
++    ] as const) {
++      await addTransaction(ledger, month, amount, category, account);
++    }
++  }
++
++  await createAllBudgets();
++  ledger.months = getCreatedMonths();
++
++  for (const month of FIRST_MONTHS) {
++    for (const [category, amount] of [
++      ['sales', 480000],
++      ['interest', 1000],
++      ['grants', 20000],
++      ['rent', 100000],
++      ['power', 12000],
++      ['repairs', 10000],
++      ['stock', 150000],
++      ['tools', 12000],
++      ['fees', 1000],
++      ['gifts', 3000],
++    ] as const) {
++      await setBudgeted(ledger, month, category, amount);
++    }
++  }
++}
++
++function readCell(month: string, name: string) {
++  const cell = sheet
++    .get()
++    .getCellValueLoose(monthUtils.sheetForMonth(month), name);
++  return typeof cell === 'number' ? cell : 0;
++}
++
++// Every way the budget disagrees with the ledger
++async function findDiscrepancies(ledger: Ledger): Promise<string[]> {
++  await sheet.waitOnSpreadsheet();
++  const expected = computeMonths(ledger);
++  const discrepancies: string[] = [];
++  const groups = await db.getCategoriesGrouped();
++
++  for (const month of ledger.months) {
++    const figures = expected.get(month);
++    if (!figures) {
++      continue;
++    }
++
++    const check = (label: string, actual: number, shouldBe: number) => {
++      if (actual !== shouldBe) {
++        discrepancies.push(
++          `${month} ${label}: ${actual}, should be ${shouldBe}`,
++        );
++      }
++    };
++
++    for (const [id, totals] of figures.categories) {
++      check(`${id} budgeted`, readCell(month, `budget-${id}`), totals.budgeted);
++      check(
++        `${id} activity`,
++        readCell(month, `sum-amount-${id}`),
++        totals.activity,
++      );
++      check(`${id} balance`, readCell(month, `leftover-${id}`), totals.balance);
++    }
++
++    for (const group of groups) {
++      const totals = figures.groups.get(group.id) ?? {
++        budgeted: 0,
++        activity: 0,
++        balance: 0,
++      };
++      check(
++        `${group.id} group budgeted`,
++        readCell(month, `group-budget-${group.id}`),
++        totals.budgeted,
++      );
++      check(
++        `${group.id} group activity`,
++        readCell(month, `group-sum-amount-${group.id}`),
++        totals.activity,
++      );
++      check(
++        `${group.id} group balance`,
++        readCell(month, `group-leftover-${group.id}`),
++        totals.balance,
++      );
++    }
++
++    check(
++      'budgeted expenses',
++      readCell(month, 'total-budgeted'),
++      figures.budgetedExpenses,
++    );
++    check('spent', readCell(month, 'total-spent'), figures.spent);
++    check(
++      'expense balance',
++      readCell(month, 'total-leftover'),
++      figures.expenseBalance,
++    );
++    check(
++      'budgeted income',
++      readCell(month, 'total-budget-income'),
++      figures.budgetedIncome,
++    );
++    check('received', readCell(month, 'total-income'), figures.received);
++    check(
++      'projected savings',
++      readCell(month, 'total-saved'),
++      figures.budgetedIncome - figures.budgetedExpenses,
++    );
++    check(
++      'saved',
++      readCell(month, 'real-saved'),
++      figures.received + figures.spent,
++    );
++  }
++
++  return discrepancies;
++}
++
++// Merging adds what was budgeted for the merged categories to the remaining
++// one, exactly as it was entered, and moves their transactions to it
++function mergeInLedger(ledger: Ledger, merged: string[], into: string) {
++  for (const month of ledger.months) {
++    const total = [...merged, into].reduce(
++      (sum, category) => sum + getBudgeted(ledger, month, category),
++      0,
++    );
++    ledger.budgeted.set(`${month}|${into}`, total);
++  }
++  for (const transaction of ledger.transactions) {
++    if (merged.includes(transaction.category)) {
++      transaction.category = into;
++    }
++  }
++  merged.forEach(category => ledger.categories.delete(category));
++}
++
++async function runAction(
++  ledger: Ledger,
++  random: ReturnType<typeof createRandom>,
++): Promise<string> {
++  const ids = (isIncome: boolean) =>
++    [...ledger.categories]
++      .filter(([, category]) => category.isIncome === isIncome)
++      .map(([id]) => id);
++  const expense = ids(false);
++  const income = ids(true);
++  const month =
++    random.next() < 0.15
++      ? random.pick(ledger.months.slice(-4))
++      : random.pick(ACTION_MONTHS);
++  const category = random.pick(expense);
++  const other = random.pick(expense.filter(id => id !== category));
++  const incomeCategory = random.pick(income);
++
++  switch (random.upTo(24)) {
++    case 0: {
++      const amount = random.upTo(60000);
++      await setBudgeted(ledger, month, category, amount);
++      return `budget ${amount} for ${category} in ${month}`;
++    }
++    case 1: {
++      const amount = random.upTo(600000);
++      await setBudgeted(ledger, month, incomeCategory, amount);
++      return `budget ${amount} for ${incomeCategory} in ${month}`;
++    }
++    case 2:
++    case 3: {
++      const flag = random.next() < 0.65;
++      await runHandler(handlers['budget/set-carryover'], {
++        startMonth: month,
++        category,
++        flag,
++      });
++      ledger.rollover.set(category, [
++        ...(ledger.rollover.get(category) ?? []),
++        [month, flag],
++      ]);
++      return `roll over ${category} from ${month}: ${flag}`;
++    }
++    case 4: {
++      if (expense.length < 4) {
++        return 'nothing';
++      }
++      await runHandler(handlers['category-delete'], {
++        id: category,
++        transferId: other,
++      });
++      mergeInLedger(ledger, [category], other);
++      return `merge ${category} into ${other}`;
++    }
++    case 5: {
++      if (income.length < 2) {
++        return 'nothing';
++      }
++      const into = random.pick(income.filter(id => id !== incomeCategory));
++      await runHandler(handlers['category-delete'], {
++        id: incomeCategory,
++        transferId: into,
++      });
++      mergeInLedger(ledger, [incomeCategory], into);
++      return `merge ${incomeCategory} into ${into}`;
++    }
++    case 6: {
++      const groups = await db.getCategoriesGrouped();
++      const group = random.pick(groups.filter(g => !g.is_income));
++      const inGroup = group.categories.map(c => c.id);
++      const outside = expense.filter(id => !inGroup.includes(id));
++      if (outside.length < 3 || inGroup.length === 0) {
++        return 'nothing';
++      }
++      const into = random.pick(outside);
++      await runHandler(handlers['category-group-delete'], {
++        id: group.id,
++        transferId: into,
++      });
++      mergeInLedger(ledger, inGroup, into);
++      return `delete group ${group.id}, merging ${inGroup.join(', ')} into ${into}`;
++    }
++    case 7:
++    case 22:
++    case 23: {
++      // Into any group, the income group included, and income categories too
++      const groups = await db.getCategoriesGrouped();
++      const group = random.pick(groups);
++      const id = random.next() < 0.75 ? category : incomeCategory;
++      await runHandler(handlers['category-move'], {
++        id,
++        groupId: group.id,
++        targetId: null,
++      });
++      const moved = ledger.categories.get(id);
++      if (moved) {
++        moved.group = group.id;
++      }
++      return `move ${id} to group ${group.id}`;
++    }
++    case 8:
++    case 9: {
++      const id = random.next() < 0.75 ? category : incomeCategory;
++      const changed = ledger.categories.get(id);
++      if (!changed) {
++        return 'nothing';
++      }
++      changed.isHidden = !changed.isHidden;
++      await db.update('categories', {
++        id,
++        hidden: changed.isHidden ? 1 : 0,
++      });
++      return `${changed.isHidden ? 'hide' : 'show'} ${id}`;
++    }
++    case 10: {
++      const groups = await db.getCategoriesGrouped();
++      const group = random.pick(groups);
++      const isHidden = !group.hidden;
++      await db.update('category_groups', {
++        id: group.id,
++        hidden: isHidden ? 1 : 0,
++      });
++      if (isHidden) {
++        ledger.hiddenGroups.add(group.id);
++      } else {
++        ledger.hiddenGroups.delete(group.id);
++      }
++      return `${isHidden ? 'hide' : 'show'} group ${group.id}`;
++    }
++    case 11: {
++      const amount = -random.upTo(30000);
++      await addTransaction(
++        ledger,
++        month,
++        amount,
++        category,
++        random.pick(['current', 'card']),
++      );
++      return `spend ${amount} on ${category} in ${month}`;
++    }
++    case 12: {
++      const amount = random.upTo(90000);
++      await addTransaction(ledger, month, amount, incomeCategory, 'current');
++      return `receive ${amount} as ${incomeCategory} in ${month}`;
++    }
++    case 13: {
++      const transaction = random.pick(ledger.transactions);
++      const amount = random.upTo(40000) - 20000;
++      await db.updateTransaction({ id: transaction.id, amount });
++      transaction.amount = amount;
++      return `change ${transaction.id} to ${amount}`;
++    }
++    case 14: {
++      const account = random.pick([...ledger.onBudget.keys()]);
++      const isOnBudget = !ledger.onBudget.get(account);
++      await db.updateAccount({ id: account, offbudget: isOnBudget ? 0 : 1 });
++      ledger.onBudget.set(account, isOnBudget);
++      return `account ${account} on budget: ${isOnBudget}`;
++    }
++    case 15: {
++      await runHandler(handlers['budget/copy-previous-month'], { month });
++      // Every category that isn't hidden, itself or through its group, gets
++      // what was budgeted the month before
++      const previous = monthUtils.prevMonth(month);
++      for (const [id, copied] of ledger.categories) {
++        if (!copied.isHidden && !ledger.hiddenGroups.has(copied.group)) {
++          ledger.budgeted.set(
++            `${month}|${id}`,
++            getBudgeted(ledger, previous, id),
++          );
++        }
++      }
++      return `copy last month's budget to ${month}`;
++    }
++    case 16: {
++      await runHandler(handlers['budget/set-zero'], { month });
++      for (const id of ledger.categories.keys()) {
++        ledger.budgeted.set(`${month}|${id}`, 0);
++      }
++      return `set budgets to zero in ${month}`;
++    }
++    case 17: {
++      await runHandler(handlers['budget/copy-single-month'], {
++        month,
++        category,
++      });
++      ledger.budgeted.set(
++        `${month}|${category}`,
++        getBudgeted(ledger, monthUtils.prevMonth(month), category),
++      );
++      return `copy last month's budget of ${category} to ${month}`;
++    }
++    case 18: {
++      await runHandler(handlers['budget/copy-until-year-end'], {
++        month,
++        category,
++      });
++      const yearEnd = `${month.slice(0, 4)}-12`;
++      for (const later of ledger.months) {
++        if (later > month && later <= yearEnd) {
++          ledger.budgeted.set(
++            `${later}|${category}`,
++            getBudgeted(ledger, month, category),
++          );
++        }
++      }
++      return `copy the budget of ${category} from ${month} until year end`;
++    }
++    case 19:
++    case 20: {
++      const groups = await db.getCategoriesGrouped();
++      const group = random.pick(groups);
++      const isHidden = random.next() < 0.3;
++      const name = `new-${random.upTo(1000000000)}`;
++      // Now and then of the other kind than its group, as an import can
++      const isIncome =
++        random.next() < 0.3 ? group.is_income !== 1 : group.is_income === 1;
++      const id = await runHandler(handlers['category-create'], {
++        name,
++        groupId: group.id,
++        isIncome,
++        hidden: isHidden,
++      });
++      ledger.categories.set(id, { group: group.id, isIncome, isHidden });
++      return `create ${isHidden ? 'hidden ' : ''}${isIncome ? 'income' : 'expense'} category ${id} in ${group.id}`;
++    }
++    default: {
++      const lastMonth = ledger.months[ledger.months.length - 1];
++      await setBudgeted(ledger, lastMonth, category, 100);
++      await createAllBudgets();
++      ledger.months = getCreatedMonths();
++      return `budget 100 for ${category} in ${lastMonth}, adding months`;
++    }
++  }
++}
++
++beforeEach(global.emptyDatabase());
++
++describe('Tracking budget against an independent ledger', () => {
++  it.each(Array.from({ length: SEEDS }, (_, index) => index + 1))(
++    'agrees after every action of random sequence %i',
++    async seed => {
++      const ledger = createLedger();
++      const random = createRandom(seed);
++      await setUpBudget(ledger);
++      expect(await findDiscrepancies(ledger)).toEqual([]);
++      await sheet.waitOnSpreadsheet();
++      const start = snapshotDatabase();
++
++      const actions: string[] = [];
++      for (let step = 0; step < STEPS; step++) {
++        actions.push(await runAction(ledger, random));
++        expect({
++          actions,
++          discrepancies: await findDiscrepancies(ledger),
++        }).toEqual({ actions, discrepancies: [] });
++      }
++
++      // And once more with the budget built from scratch
++      await sheet.waitOnSpreadsheet();
++      sheet.unloadSpreadsheet();
++      await sheet.loadSpreadsheet(db);
++      sheet.get().meta().budgetType = 'tracking';
++      await createAllBudgets();
++      ledger.months = getCreatedMonths();
++      expect({
++        actions,
++        discrepancies: await findDiscrepancies(ledger),
++      }).toEqual({ actions, discrepancies: [] });
++
++      // And with everything delivered to the budget as it started out in one
++      // sync, the way a device that was offline receives it
++      await sheet.waitOnSpreadsheet();
++      await replayChangesAsOneSync(start, async () => {
++        sheet.unloadSpreadsheet();
++        await sheet.loadSpreadsheet(db);
++        sheet.get().meta().budgetType = 'tracking';
++        await createAllBudgets();
++        await sheet.waitOnSpreadsheet();
++      });
++      await createAllBudgets();
++      ledger.months = getCreatedMonths();
++      expect({
++        actions,
++        discrepancies: await findDiscrepancies(ledger),
++      }).toEqual({ actions, discrepancies: [] });
++    },
++  );
++});
+diff --git a/packages/loot-core/src/server/budget/tracking.ts b/packages/loot-core/src/server/budget/tracking.ts
+index c1c85300d..a040cd032 100644
+--- a/packages/loot-core/src/server/budget/tracking.ts
++++ b/packages/loot-core/src/server/budget/tracking.ts
+@@ -6,7 +6,14 @@ import * as monthUtils from '#shared/months';
+ import { safeNumber } from '#shared/util';
+ 
+ import { createCategory as createCategoryFromBase } from './base';
+-import { number, sumAmounts } from './util';
++import {
++  getIncomeGroupIds,
++  getInheritedCarryover,
++  getMisfiledCategories,
++  isFiledUnderOwnKind,
++  number,
++  sumAmounts,
++} from './util';
+ 
+ export async function createCategory(cat, sheetName, prevSheetName) {
+   sheet.get().createStatic(sheetName, `budget-${cat.id}`, 0);
+@@ -60,30 +67,35 @@ export async function createCategory(cat, sheetName, prevSheetName) {
+     },
+   });
+ 
+-  sheet.get().createStatic(sheetName, `carryover-${cat.id}`, false);
++  sheet
++    .get()
++    .createStatic(
++      sheetName,
++      `carryover-${cat.id}`,
++      getInheritedCarryover(cat, prevSheetName),
++    );
+ }
+ 
+ export function createCategoryGroup(group, sheetName) {
+-  // different sum amount dependencies
++  // Hidden categories aren't counted, and neither is one filed in a group
++  // of the other kind: that goes into the month's totals itself
++  const categories = group.categories.filter(
++    cat => !cat.hidden && isFiledUnderOwnKind(cat, group),
++  );
++
+   sheet.get().createDynamic(sheetName, 'group-sum-amount-' + group.id, {
+     initialValue: 0,
+-    dependencies: group.categories
+-      .filter(cat => !cat.hidden)
+-      .map(cat => `sum-amount-${cat.id}`),
++    dependencies: categories.map(cat => `sum-amount-${cat.id}`),
+     run: sumAmounts,
+   });
+   sheet.get().createDynamic(sheetName, 'group-budget-' + group.id, {
+     initialValue: 0,
+-    dependencies: group.categories
+-      .filter(cat => !cat.hidden)
+-      .map(cat => `budget-${cat.id}`),
++    dependencies: categories.map(cat => `budget-${cat.id}`),
+     run: sumAmounts,
+   });
+   sheet.get().createDynamic(sheetName, 'group-leftover-' + group.id, {
+     initialValue: 0,
+-    dependencies: group.categories
+-      .filter(cat => !cat.hidden)
+-      .map(cat => `leftover-${cat.id}`),
++    dependencies: categories.map(cat => `leftover-${cat.id}`),
+     run: sumAmounts,
+   });
+ }
+@@ -93,36 +105,57 @@ export function createSummary(groups, sheetName) {
+   const expenseGroups = groups.filter(
+     group => !group.is_income && !group.hidden,
+   );
++  const misfiledIncome = getMisfiledCategories(groups, {
++    isIncome: true,
++  }).filter(cat => !cat.hidden);
++  const misfiledExpenses = getMisfiledCategories(groups, {
++    isIncome: false,
++  }).filter(cat => !cat.hidden);
+ 
+   sheet.get().createDynamic(sheetName, 'total-budgeted', {
+     initialValue: 0,
+-    dependencies: expenseGroups.map(group => `group-budget-${group.id}`),
++    dependencies: [
++      ...expenseGroups.map(group => `group-budget-${group.id}`),
++      ...misfiledExpenses.map(cat => `budget-${cat.id}`),
++    ],
+     run: sumAmounts,
+   });
+ 
+   sheet.get().createDynamic(sheetName, 'total-spent', {
+     initialValue: 0,
+     refresh: true,
+-    dependencies: expenseGroups.map(group => `group-sum-amount-${group.id}`),
++    dependencies: [
++      ...expenseGroups.map(group => `group-sum-amount-${group.id}`),
++      ...misfiledExpenses.map(cat => `sum-amount-${cat.id}`),
++    ],
+     run: sumAmounts,
+   });
+ 
+   sheet.get().createDynamic(sheetName, 'total-income', {
+     initialValue: 0,
+-    dependencies: [`group-sum-amount-${incomeGroup.id}`],
+-    run: amount => amount,
++    dependencies: [
++      `group-sum-amount-${incomeGroup.id}`,
++      ...misfiledIncome.map(cat => `sum-amount-${cat.id}`),
++    ],
++    run: sumAmounts,
+   });
+ 
+   sheet.get().createDynamic(sheetName, 'total-leftover', {
+     initialValue: 0,
+-    dependencies: expenseGroups.map(g => `group-leftover-${g.id}`),
++    dependencies: [
++      ...expenseGroups.map(g => `group-leftover-${g.id}`),
++      ...misfiledExpenses.map(cat => `leftover-${cat.id}`),
++    ],
+     run: sumAmounts,
+   });
+ 
+   sheet.get().createDynamic(sheetName, 'total-budget-income', {
+     initialValue: 0,
+-    dependencies: [`group-budget-${incomeGroup.id}`],
+-    run: amount => amount,
++    dependencies: [
++      `group-budget-${incomeGroup.id}`,
++      ...misfiledIncome.map(cat => `budget-${cat.id}`),
++    ],
++    run: sumAmounts,
+   });
+ 
+   sheet.get().createDynamic(sheetName, 'total-saved', {
+@@ -143,89 +176,91 @@ export function createSummary(groups, sheetName) {
+ }
+ 
+ export function handleCategoryChange(months, oldValue, newValue) {
+-  function addDeps(sheetName, groupId, catId) {
+-    sheet
+-      .get()
+-      .addDependencies(sheetName, `group-sum-amount-${groupId}`, [
+-        `sum-amount-${catId}`,
+-      ]);
+-    sheet
+-      .get()
+-      .addDependencies(sheetName, `group-budget-${groupId}`, [
+-        `budget-${catId}`,
+-      ]);
+-    sheet
+-      .get()
+-      .addDependencies(sheetName, `group-leftover-${groupId}`, [
+-        `leftover-${catId}`,
+-      ]);
++  type Deps = Array<[string, string[]]>;
++
++  let incomeGroupIds: Set<string> | null = null;
++  function isIncomeGroup(groupId): boolean {
++    incomeGroupIds ??= getIncomeGroupIds();
++    return incomeGroupIds.has(groupId);
+   }
+ 
+-  function removeDeps(sheetName, groupId, catId) {
+-    sheet
+-      .get()
+-      .removeDependencies(sheetName, `group-sum-amount-${groupId}`, [
+-        `sum-amount-${catId}`,
+-      ]);
+-    sheet
+-      .get()
+-      .removeDependencies(sheetName, `group-budget-${groupId}`, [
+-        `budget-${catId}`,
+-      ]);
+-    sheet
+-      .get()
+-      .removeDependencies(sheetName, `group-leftover-${groupId}`, [
+-        `leftover-${catId}`,
+-      ]);
++  // The totals a category in the given group is added up in: those of the
++  // group, or the month's own when it is filed in a group of the other kind
++  // (see `isFiledUnderOwnKind`)
++  function getDeps(groupId, cat): Deps {
++    if (isIncomeGroup(groupId) === Boolean(cat.is_income)) {
++      return [
++        [`group-sum-amount-${groupId}`, [`sum-amount-${cat.id}`]],
++        [`group-budget-${groupId}`, [`budget-${cat.id}`]],
++        [`group-leftover-${groupId}`, [`leftover-${cat.id}`]],
++      ];
++    }
++
++    if (cat.is_income) {
++      return [
++        ['total-income', [`sum-amount-${cat.id}`]],
++        ['total-budget-income', [`budget-${cat.id}`]],
++      ];
++    }
++
++    return [
++      ['total-budgeted', [`budget-${cat.id}`]],
++      ['total-spent', [`sum-amount-${cat.id}`]],
++      ['total-leftover', [`leftover-${cat.id}`]],
++    ];
+   }
+ 
+-  if (oldValue && oldValue.tombstone === 0 && newValue.tombstone === 1) {
+-    const id = newValue.id;
+-    const groupId = newValue.cat_group;
++  function addDeps(sheetName, groupId, cat) {
++    getDeps(groupId, cat).forEach(([cellName, deps]) => {
++      sheet.get().addDependencies(sheetName, cellName, deps);
++    });
++  }
+ 
+-    months.forEach(month => {
+-      const sheetName = monthUtils.sheetForMonth(month);
+-      removeDeps(sheetName, groupId, id);
++  function removeDeps(sheetName, groupId, cat) {
++    getDeps(groupId, cat).forEach(([cellName, deps]) => {
++      sheet.get().removeDependencies(sheetName, cellName, deps);
+     });
+-  } else if (
+-    newValue.tombstone === 0 &&
+-    (!oldValue || oldValue.tombstone === 1)
+-  ) {
+-    months.forEach(month => {
+-      const prevMonth = monthUtils.prevMonth(month);
+-      const prevSheetName = monthUtils.sheetForMonth(prevMonth);
+-      const sheetName = monthUtils.sheetForMonth(month);
+-      const { start, end } = monthUtils.bounds(month);
++  }
+ 
+-      createCategoryFromBase(newValue, sheetName, prevSheetName, start, end);
++  // Several changes to a category can arrive at once: a sync delivers
++  // everything another device did since the last one, so a category can be
++  // moved, hidden and deleted all together. Compare the group it was counted
++  // in with the one it belongs in now instead of handling one kind of change.
++  // Hidden categories are left out of the group totals, like in
++  // `createCategoryGroup`.
++  const wasAlive = oldValue != null && oldValue.tombstone === 0;
++  const isAlive = newValue.tombstone === 0;
++  const wasCounted = wasAlive && !oldValue.hidden;
++  const isCounted = isAlive && !newValue.hidden;
++  const hasChangedGroup =
++    wasCounted !== isCounted ||
++    (isCounted && oldValue.cat_group !== newValue.cat_group);
++  const isAdded = isAlive && !wasAlive;
+ 
+-      const id = newValue.id;
+-      const groupId = newValue.cat_group;
++  if (!isAdded && !hasChangedGroup) {
++    return;
++  }
+ 
+-      addDeps(sheetName, groupId, id);
+-    });
+-  } else if (oldValue && oldValue.cat_group !== newValue.cat_group) {
+-    // The category moved so we need to update the dependencies
+-    const id = newValue.id;
+-
+-    months.forEach(month => {
+-      const sheetName = monthUtils.sheetForMonth(month);
+-      removeDeps(sheetName, oldValue.cat_group, id);
+-      addDeps(sheetName, newValue.cat_group, id);
+-    });
+-  } else if (oldValue && oldValue.hidden !== newValue.hidden) {
+-    const id = newValue.id;
+-    const groupId = newValue.cat_group;
+-
+-    months.forEach(month => {
+-      const sheetName = monthUtils.sheetForMonth(month);
+-      if (newValue.hidden) {
+-        removeDeps(sheetName, groupId, id);
+-      } else {
+-        addDeps(sheetName, groupId, id);
++  // Oldest first: a month's cells can depend on the month before it
++  [...(months as Set<string>)].sort().forEach(month => {
++    const prevMonth = monthUtils.prevMonth(month);
++    const prevSheetName = monthUtils.sheetForMonth(prevMonth);
++    const sheetName = monthUtils.sheetForMonth(month);
++
++    if (isAdded) {
++      const { start, end } = monthUtils.bounds(month);
++      createCategoryFromBase(newValue, sheetName, prevSheetName, start, end);
++    }
++
++    if (hasChangedGroup) {
++      if (wasCounted) {
++        removeDeps(sheetName, oldValue.cat_group, newValue);
+       }
+-    });
+-  }
++      if (isCounted) {
++        addDeps(sheetName, newValue.cat_group, newValue);
++      }
++    }
++  });
+ }
+ 
+ export function handleCategoryGroupChange(months, oldValue, newValue) {
+@@ -265,44 +300,44 @@ export function handleCategoryGroupChange(months, oldValue, newValue) {
+       ]);
+   }
+ 
+-  if (newValue.tombstone === 1 && oldValue && oldValue.tombstone === 0) {
+-    const id = newValue.id;
+-    months.forEach(month => {
+-      const sheetName = monthUtils.sheetForMonth(month);
+-      removeDeps(sheetName, id);
+-    });
+-  } else if (
+-    newValue.tombstone === 0 &&
+-    (!oldValue || oldValue.tombstone === 1)
+-  ) {
+-    const group = newValue;
+-
+-    months.forEach(month => {
+-      const sheetName = monthUtils.sheetForMonth(month);
+-
+-      // Dirty, dirty hack. These functions should not be async, but this is
+-      // OK because we're leveraging the sync nature of queries. Ideally we
+-      // wouldn't be querying here. But I think we have to. At least for now
+-      // we do
+-      const categories = db.runQuery(
++  // As with categories, a sync can deliver several changes to a group at
++  // once, so compare whether it was counted with whether it should be now.
++  // Only visible expense groups make up the totals, like in `createSummary`:
++  // the income group has totals of its own.
++  const group = newValue;
++  const wasAlive = oldValue != null && oldValue.tombstone === 0;
++  const isAlive = group.tombstone === 0;
++  const wasCounted = wasAlive && !oldValue.is_income && !oldValue.hidden;
++  const isCounted = isAlive && !group.is_income && !group.hidden;
++  const isAdded = isAlive && !wasAlive;
++
++  if (!isAdded && wasCounted === isCounted) {
++    return;
++  }
++
++  // Dirty, dirty hack. These functions should not be async, but this is
++  // OK because we're leveraging the sync nature of queries. Ideally we
++  // wouldn't be querying here. But I think we have to. At least for now
++  // we do
++  const categories = isAdded
++    ? db.runQuery(
+         'SELECT * FROM categories WHERE tombstone = 0 AND cat_group = ?',
+         [group.id],
+         true,
+-      );
++      )
++    : [];
++
++  months.forEach(month => {
++    const sheetName = monthUtils.sheetForMonth(month);
++
++    if (isAdded) {
+       createCategoryGroup({ ...group, categories }, sheetName);
++    }
+ 
++    if (wasCounted && !isCounted) {
++      removeDeps(sheetName, group.id);
++    } else if (isCounted && !wasCounted) {
+       addDeps(sheetName, group.id);
+-    });
+-  } else if (oldValue && oldValue.hidden !== newValue.hidden) {
+-    const group = newValue;
+-
+-    months.forEach(month => {
+-      const sheetName = monthUtils.sheetForMonth(month);
+-      if (newValue.hidden) {
+-        removeDeps(sheetName, group.id);
+-      } else {
+-        addDeps(sheetName, group.id);
+-      }
+-    });
+-  }
++    }
++  });
+ }
+diff --git a/packages/loot-core/src/server/budget/util.ts b/packages/loot-core/src/server/budget/util.ts
+index 50681766f..403f4869d 100644
+--- a/packages/loot-core/src/server/budget/util.ts
++++ b/packages/loot-core/src/server/budget/util.ts
+@@ -1,3 +1,5 @@
++import * as db from '#server/db';
++import * as sheet from '#server/sheet';
+ import { number } from '#server/spreadsheet/globals';
+ // @ts-strict-ignore
+ import { safeNumber } from '#shared/util';
+@@ -23,3 +25,52 @@ export function unflatten2(arr) {
+   }
+   return res;
+ }
++
++// Whether a category rolls over its overspending in a month nothing has been
++// saved for yet. Turning it on applies to every later month, but it is only
++// saved for the months that exist at that point, so months added afterwards
++// carry on from the month before them. Holding income automatically is
++// different: it only ever covers the months it was turned on for.
++export function getInheritedCarryover(cat, prevSheetName): boolean {
++  if (cat.is_income) {
++    return false;
++  }
++  return (
++    sheet.get().getCellValueLoose(prevSheetName, `carryover-${cat.id}`) === true
++  );
++}
++
++// A category is income or an expense by its own setting, wherever it is
++// filed. The screens only let it be filed in a group of its own kind, but the
++// API, an import or a sync can leave an expense category in the income group
++// or the other way round. Such a category is left out of the totals of the
++// group, which only add up categories of the group's kind, and goes straight
++// into the month's totals for its own kind instead. Otherwise spending in it
++// would be taken off the income.
++export function isFiledUnderOwnKind(cat, group): boolean {
++  return Boolean(cat.is_income) === Boolean(group.is_income);
++}
++
++// The categories of the given kind that are filed in a group of the other
++// kind
++export function getMisfiledCategories(
++  groups,
++  { isIncome }: { isIncome: boolean },
++) {
++  return groups
++    .filter(group => Boolean(group.is_income) !== isIncome)
++    .flatMap(group =>
++      (group.categories ?? []).filter(
++        cat => Boolean(cat.is_income) === isIncome,
++      ),
++    );
++}
++
++export function getIncomeGroupIds(): Set<string> {
++  const rows = db.runQuery<Pick<db.DbCategoryGroup, 'id'>>(
++    'SELECT id FROM category_groups WHERE is_income = 1',
++    [],
++    true,
++  );
++  return new Set(rows.map(row => row.id));
++}
+diff --git a/packages/loot-core/src/server/db/index.ts b/packages/loot-core/src/server/db/index.ts
+index 43f6f4551..b56b22cde 100644
+--- a/packages/loot-core/src/server/db/index.ts
++++ b/packages/loot-core/src/server/db/index.ts
+@@ -446,8 +446,11 @@ export async function deleteCategoryGroup(
+   group: Pick<DbCategoryGroup, 'id'>,
+   transferId?: DbCategory['id'] | null,
+ ) {
++  // Categories already deleted from the group stay as they are: one that was
++  // merged into a category elsewhere keeps pointing there, rather than having
++  // its transactions follow this group's categories to `transferId`.
+   const categories = await all<DbCategory>(
+-    'SELECT * FROM categories WHERE cat_group = ?',
++    'SELECT * FROM categories WHERE cat_group = ? AND tombstone = 0',
+     [group.id],
+   );
+ 
+diff --git a/upcoming-release-notes/fix-budget-totals-after-reorganising-categories.md b/upcoming-release-notes/fix-budget-totals-after-reorganising-categories.md
+new file mode 100644
+index 000000000..2b548536f
+--- /dev/null
++++ b/upcoming-release-notes/fix-budget-totals-after-reorganising-categories.md
+@@ -0,0 +1,6 @@
++---
++category: Bugfix
++authors: [YourGitHubUsername]
++---
++
++Fix budget totals going out of balance after moving, merging, hiding or deleting categories, when an expense category is filed under the income group, when holding funds on top of an automatic hold, when copying last month's budget, or when adding months to a budget that rolls over overspending
